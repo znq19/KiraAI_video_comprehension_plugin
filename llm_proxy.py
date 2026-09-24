@@ -193,11 +193,17 @@ async def analyze_gemini_native(profile: "ModelProfile", video_path: str,
 
 async def analyze_frames(profile: ModelProfile, grids: list[str],
                           meta: str, question: str, default_prompt: str) -> str:
+    """拼图帧分析。
+
+    grids 为空 = 纯文字模式（会话画面帧被回收后仍可基于文字资料追问）：
+    此时只发文本，不做任何 vision 假设。
+    """
     client = AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base)
     content = [{"type": "text", "text": meta}]
     for b in grids:
         content.append({"type": "image_url", "image_url": {"url": b, "detail": "high"}})
-    content.append({"type": "text", "text": default_prompt + "\n\n" + question})
+    tail = (default_prompt + "\n\n" + question) if default_prompt else question
+    content.append({"type": "text", "text": tail})
     resp = await client.chat.completions.create(
         model=profile.name,
         messages=[{"role": "user", "content": content}],

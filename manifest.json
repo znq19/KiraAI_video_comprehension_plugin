@@ -1,7 +1,7 @@
 {
   "display_name": "Video Comprehension 视频理解",
   "plugin_id": "video-comprehension",
-  "version": "1.16.7",
+  "version": "1.17.0",
   "author": "znq19",
   "description": "让你的Bot也能看视频。QQ/B站/本地视频可原生多模态或抽帧模式发送相应模型分析并可详细理解。附带B站视频下载功能。",
   "repo": "https://github.com/znq19/KiraAI_video_comprehension_plugin",

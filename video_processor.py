@@ -79,16 +79,22 @@ def _format_ts(seconds: float) -> str:
 
 
 def _get_video_info(video_path: str) -> dict:
-    """用 ffprobe 读取视频基本信息"""
+    """用 ffprobe 读取视频基本信息（同步；调用方应经 to_thread 使用）"""
     cmd = [
         "ffprobe", "-v", "quiet", "-print_format", "json",
         "-show_format", "-show_streams",
         video_path,
     ]
-    r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return {"duration": 0, "width": 0, "height": 0, "size": 0}
     if r.returncode != 0:
         return {"duration": 0, "width": 0, "height": 0, "size": 0}
-    info = json.loads(r.stdout)
+    try:
+        info = json.loads(r.stdout)
+    except Exception:
+        return {"duration": 0, "width": 0, "height": 0, "size": 0}
     duration = 0
     width, height = 0, 0
     for s in info.get("streams", []):
@@ -99,6 +105,11 @@ def _get_video_info(video_path: str) -> dict:
             break
     file_size = int(info.get("format", {}).get("size", 0))
     return {"duration": duration, "width": width, "height": height, "size": file_size}
+
+
+async def get_video_info_async(video_path: str) -> dict:
+    """ffprobe 探测（在线程池里跑，避免阻塞事件循环）"""
+    return await asyncio.to_thread(_get_video_info, video_path)
 
 
 # ── 视频下载 ───────────────────────────────────────────────
@@ -401,14 +412,20 @@ async def extract_frames(
     避免 select filter 的帧索引漂移问题；时间戳始终为视频绝对时间。
     """
     out_dir = tempfile.mkdtemp(prefix="vcf_")
-    info = _get_video_info(video_path)
+    info = await asyncio.to_thread(_get_video_info, video_path)
     duration = info.get("duration", 0)
     if duration <= 0:
-        cmd = ["ffmpeg", "-i", video_path, "-f", "null", "-"]
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-        m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", r.stderr)
-        if m:
-            duration = int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        def _probe_duration():
+            cmd = ["ffmpeg", "-i", video_path, "-f", "null", "-"]
+            try:
+                r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
+            except Exception:
+                return 0.0
+            m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", r.stderr or "")
+            if not m:
+                return 0.0
+            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+        duration = await asyncio.to_thread(_probe_duration)
     if duration <= 0:
         return []
 
@@ -425,8 +442,12 @@ async def extract_frames(
     result = []
     for si, (s, e) in enumerate(segs):
         n = segment_frame_budget(e - s, n_seg, target_frames)
-        result.extend(_extract_range(video_path, out_dir, all_frames,
-                                     s, e, n, scene_threshold, seg_idx=si))
+        # ⚠️ _extract_range 内部是逐帧 subprocess.run（最多几十次），**必须**
+        #    丢到线程池 —— 否则会阻塞事件循环，拖住全局计时器（含框架的工具超时）
+        part = await asyncio.to_thread(
+            _extract_range, video_path, out_dir, all_frames, s, e, n,
+            scene_threshold, si)
+        result.extend(part)
     return result
 
 
@@ -453,6 +474,7 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
         if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
             raise RuntimeError(f"裁剪失败: {(r.stderr or '')[:300]}")
+        # ⚠️ 这里本来就在线程池里，可以直接用同步版探测（不要再套 to_thread）
         info = _get_video_info(dst)
         real_dur = float(info.get("duration") or req_dur)
         # 秒切会从最近的关键帧开始 → 实际时长 > 请求时长，差值即起点提前量
@@ -640,7 +662,7 @@ def stamp_frame(frame_img: Image.Image, timestamp: float,
 
 # ── 拼图合成 ───────────────────────────────────────────────
 
-async def composite_grid(
+def _composite_grid_sync(
     frames: list[dict],
     cols: int = 5,
     max_per_grid: int = 20,
@@ -652,9 +674,9 @@ async def composite_grid(
     scene_count: int = 0,
     seg_label: str = "",
 ) -> list[Image.Image]:
-    """将帧列表合成一张或多张拼图
+    """拼图合成（同步实现；由 composite_grid 丢到线程池执行）。
 
-    返回 Image.Image 列表（帧数超 max_per_grid 自动分片）
+    ⚠️ PIL 的 LANCZOS 缩放与逐帧绘制都是纯 CPU 重活，必须离开事件循环。
     """
     if not frames:
         return []
@@ -677,8 +699,6 @@ async def composite_grid(
     # 分片
     chunks = [frames[i:i + max_per_grid] for i in range(0, len(frames), max_per_grid)]
     results = []
-
-    loop = asyncio.get_event_loop()
 
     for chunk_idx, chunk in enumerate(chunks):
         total = len(chunk)
@@ -747,6 +767,29 @@ async def composite_grid(
         results.append(grid_img)
 
     return results
+
+
+async def composite_grid(
+    frames: list[dict],
+    cols: int = 5,
+    max_per_grid: int = 20,
+    cell_width: int = 320,
+    cell_ratio: str = "16:9",
+    duration: float = 0,
+    video_width: int = 0,
+    video_height: int = 0,
+    scene_count: int = 0,
+    seg_label: str = "",
+) -> list[Image.Image]:
+    """将帧列表合成一张或多张拼图（在线程池里跑，不阻塞事件循环）
+
+    返回 Image.Image 列表（帧数超 max_per_grid 自动分片）
+    """
+    if not frames:
+        return []
+    return await asyncio.to_thread(
+        _composite_grid_sync, frames, cols, max_per_grid, cell_width, cell_ratio,
+        duration, video_width, video_height, scene_count, seg_label)
 
 
 # ── 保存拼图为 base64 ─────────────────────────────────────
@@ -828,7 +871,11 @@ async def process_video(
         # 2. 检查大小
         file_size_mb = os.path.getsize(raw_path) / (1024 * 1024)
         if file_size_mb > max_file_mb:
-            os.remove(raw_path)
+            # ⚠️ 只删「我们下载的临时文件」：本地文件是用户/缓存的东西，
+            #    不能因为超限就删掉（曾会误删 data/ 下的缓存视频）
+            if not is_local:
+                try: os.remove(raw_path)
+                except OSError: pass
             return {
                 "status": "rejected",
                 "error": f"视频文件过大 ({file_size_mb:.1f}MB > {max_file_mb}MB 限制)",
@@ -836,13 +883,15 @@ async def process_video(
             }
 
         # 3. 获取基本信息
-        info = _get_video_info(raw_path)
+        info = await asyncio.to_thread(_get_video_info, raw_path)
         duration = info.get("duration", 0)
         width = info.get("width", 0)
         height = info.get("height", 0)
 
         if duration > max_duration_sec:
-            os.remove(raw_path)
+            if not is_local:
+                try: os.remove(raw_path)
+                except OSError: pass
             return {
                 "status": "rejected",
                 "error": f"视频时长过长 ({duration:.0f}s > {max_duration_sec}s 限制)",
@@ -903,8 +952,9 @@ async def process_video(
                 seg_label=label,
             ))
 
-        # 7. 转 base64
-        grids_b64 = [grid_to_base64(g) for g in grids]
+        # 7. 转 base64（JPEG 编码是 CPU 重活，丢线程池，别卡住事件循环）
+        grids_b64 = await asyncio.to_thread(
+            lambda: [grid_to_base64(g) for g in grids])
 
         elapsed = time.time() - start
 

@@ -15,11 +15,6 @@
         "default": false,
         "hint": "关掉后 analyze_video 工具不可用，send_video / search_bili_video 仍可用"
       },
-      "auto_select": {
-        "type": "switch",
-        "name": "自动选择模型",
-        "default": true
-      },
       "default_model": {
         "type": "string",
         "name": "默认模型组",
@@ -516,7 +511,8 @@
       "bili_use_ai_summary": {
         "type": "switch",
         "name": "优先B站AI总结",
-        "default": true
+        "default": false,
+        "hint": "默认关闭。B站的AI总结接口需要登录态 Cookie 才会返回内容，未填 Cookie 时每次分析都会先白跑一次请求再降级，因此默认关。若你已配置 B站 Cookie 且希望优先用官方总结（更快、0 token），可打开"
       },
       "auto_send_link": {
         "type": "switch",
@@ -592,10 +588,10 @@
       "bili_max_download_sec": {
         "type": "integer",
         "name": "下载最大时长(秒)",
-        "default": 600,
+        "default": 1800,
         "minimum": 10,
         "maximum": 7200,
-        "hint": "仅用于「发视频到 QQ」链路；视频分析链路的时长限制统一由 安全限制 → 最大视频时长 控制"
+        "hint": "默认 1800 秒（30 分钟）。仅用于「发视频到 QQ」链路；视频分析链路的时长限制统一由 安全限制 → 最大视频时长 控制"
       }
     }
   },
@@ -744,8 +740,8 @@
       "audio_concurrency": {
         "type": "integer",
         "name": "兜底切块并发数",
-        "default": 5,
-        "hint": "仅切块兜底路径用。调大能显著缩短长视频转写时间（5 分钟视频：并发3约38秒、并发5约23秒），但别超过你 ASR 服务的并发限制"
+        "default": 10,
+        "hint": "仅切块兜底路径用。调大能显著缩短长视频转写时间，但别超过你 ASR 服务的并发限制"
       },
       "audio_use_proxy": {
         "type": "switch",
@@ -780,6 +776,74 @@
         "type": "markdown",
         "name": "默认分析提示词",
         "default": "你刚刚收到一个视频。请分析其内容，包括：\n1. 视频整体描述\n2. 关键事件时间线\n3. 值得注意的细节\n4. 语音/对话内容"
+      }
+    }
+  },
+  "section_async": {
+    "type": "section",
+    "name": "⚡ 异步与并发",
+    "collapsed": false,
+    "fields": {
+      "async_analyze": {
+        "type": "switch",
+        "name": "异步分析（首次分析后台执行）",
+        "default": true,
+        "hint": "默认开启。工具毫秒级返回（只回一句「正在看，稍等」），下载/抽帧/转写/模型调用全在后台进行，完成后自动把结果交给 AI 讲给用户。这样既不阻塞主 LLM，也不受框架「工具调用超时」限制。关闭则工具等分析完再返回（会受框架工具超时制约，不建议）"
+      },
+      "async_followup": {
+        "type": "switch",
+        "name": "异步追问",
+        "default": false,
+        "hint": "默认关闭。追问（带 session_id）复用内存里已有的拼图，通常几秒就有结果，同步返回即可。若你的模型很慢、常撞框架工具超时，可打开"
+      },
+      "max_parallel_per_chat": {
+        "type": "integer",
+        "name": "每会话最大并行分析数",
+        "default": 3,
+        "minimum": 1,
+        "maximum": 10,
+        "hint": "同一个群/私聊里同时进行的分析任务上限，超出的排队等待。追问不计入此上限（追问很轻，不下载不抽帧）"
+      },
+      "max_parallel_global": {
+        "type": "integer",
+        "name": "全局最大并行分析数",
+        "default": 6,
+        "minimum": 0,
+        "maximum": 32,
+        "hint": "所有会话加起来同时进行的分析任务上限，避免多个群同时开跑把 CPU/带宽打满。0 = 不限制"
+      },
+      "queue_timeout_sec": {
+        "type": "integer",
+        "name": "排队等待上限(秒)",
+        "default": 600,
+        "minimum": 0,
+        "hint": "排队超过这个时间仍未轮到，就放弃该任务并告知用户（不会静默丢掉）。0 = 一直等"
+      },
+      "analysis_budget_sec": {
+        "type": "integer",
+        "name": "单次分析软预算(秒)",
+        "default": 200,
+        "hint": "工具最多原地等这么久；到点不算失败，而是转为后台继续跑，完成后照常把结果交回来。本插件的时间与框架的工具超时相互独立"
+      },
+      "pipeline_hard_timeout_sec": {
+        "type": "integer",
+        "name": "单次分析硬上限(秒)",
+        "default": 0,
+        "minimum": 0,
+        "hint": "真正的强制中止时间，超时则取消任务并告知失败。0 = 不设（推荐；配合软预算足够）"
+      },
+      "notice_coalesce_sec": {
+        "type": "float",
+        "name": "完成通知合并窗口(秒)",
+        "default": 2.0,
+        "hint": "多个分析任务几乎同时完成时，把它们的结果合并成一条通知，避免连开多轮对话刷屏"
+      },
+      "task_keep_minutes": {
+        "type": "integer",
+        "name": "任务记录保留(分)",
+        "default": 30,
+        "minimum": 1,
+        "hint": "后台任务记录（状态/结果/耗时）保留多久，用于诊断与重复调用识别"
       }
     }
   }

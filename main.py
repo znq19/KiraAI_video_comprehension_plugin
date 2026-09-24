@@ -149,6 +149,49 @@ class VideoSession:
         self.last_interact = time.time()
 
 
+class VideoTask:
+    """一次后台分析任务的显式记录。
+
+    设计要点（对应「与框架工具超时脱钩」）：
+      - 工具调用只负责建任务并立刻返回（L1：提交路径永不 await 分析体）
+      - 真正的分析体跑在独立 Task 上，且内部重活全部离开事件循环（L2）
+      - 即使工具协程被框架 wait_for 取消，任务依然存活并最终通告（L3）
+    """
+    __slots__ = ("task_id", "sid", "kind", "state", "created_at", "started_at",
+                 "finished_at", "session_id", "title", "detail", "result", "error",
+                 "progress", "asyncio_task", "cancel_requested", "budget_exceeded",
+                 "notified", "slot_released", "queue_timer", "_dup_key", "reserved")
+
+    def __init__(self, task_id: str, sid: str, kind: str, title: str = "", detail: str = "",
+                 dup_key: str = ""):
+        self.task_id = task_id
+        self.sid = sid
+        self.kind = kind                  # first | segment | followup
+        self.state = "queued"             # queued | running | done | failed | rejected | cancelled
+        self.created_at = time.time()
+        self.started_at = 0.0
+        self.finished_at = 0.0
+        self.session_id = ""
+        self.title = title
+        self.detail = detail              # 头部展示用的一行（时长/画质等）
+        self.result = ""                  # 完整结果文本（通告用）
+        self.error = ""
+        self.progress = "已排队"
+        self.asyncio_task: Optional[asyncio.Task] = None
+        self.cancel_requested = False
+        self.budget_exceeded = False
+        self.notified = False
+        self.slot_released = False
+        self.queue_timer: Optional[asyncio.Task] = None
+        self._dup_key = dup_key           # 去重键（防 bot 重复调用导致重复下载）
+        self.reserved = False             # 是否已占住并发槽（提交时同步决定）
+
+    @property
+    def elapsed(self) -> float:
+        end = self.finished_at or time.time()
+        return max(0.0, end - (self.started_at or self.created_at))
+
+
 class VideoComprehensionPlugin(BasePlugin):
     def __init__(self, ctx, cfg: dict):
         super().__init__(ctx, cfg)
@@ -165,14 +208,31 @@ class VideoComprehensionPlugin(BasePlugin):
         self._cached_videos: dict[str, list] = {}   # sid → [{orig_name, path, rel, size_mb, ts}, ...]
         self._video_failures: dict[str, dict] = {}  # sid → {原文件名: 失败原因}（供消息改写）
         self._asr_tasks: dict[str, asyncio.Task] = {}   # 转写缓存 key → 进行中的任务
+        # ── 异步分析任务（v1.17.0） ──
+        self._tasks: dict[str, VideoTask] = {}          # task_id → VideoTask
+        self._task_seq: dict[str, int] = {}             # sid → 已发放的短号计数
+        self._chat_running: dict[str, int] = {}         # sid → 正在跑的分析任务数
+        self._global_running = 0
+        self._slot_events: dict[str, asyncio.Event] = {}  # sid → 槽位释放唤醒
+        self._notice_buffer: dict[str, list] = {}       # sid → [已完成待合并通告的任务]
+        self._flushing: set = set()                     # 正在发通告的会话（防竞态）
+        self._notice_tasks: set = set()
+        self._background_tasks: set = set()             # 后台任务引用（防被 GC 回收）
+        self._migrated_keys: set = set()
+        self._bg_sem: Optional[asyncio.Semaphore] = None   # 缓存/转写用的后台闸
+        self._bg_sem_limit = 0                             # 上面那个闸的上限（配置变了要重建）
         self._load_cfg(cfg)
 
     def _load_cfg(self, cfg: dict):
         """读取/热重载配置（不影响会话与后台任务状态）"""
+        # 配置自动迁移：必须在读取之前，保证本次运行就用上新默认值
+        try:
+            self._migrate_config(cfg)
+        except Exception as e:
+            logger.warning("[VC] 配置迁移异常（已忽略，不影响加载）: %s", e)
         basic = cfg.get("section_basic", {}) or {}
         self.enabled = basic.get("enabled", True)
         self.video_analysis_enabled = basic.get("video_analysis_enabled", False)
-        self.auto_select = basic.get("auto_select", True)
         self.default_model = str(basic.get("default_model", "auto"))
         self.allowed_adapters = basic.get("allowed_adapters", [])
         self.max_session_per_user = int(basic.get("max_session_per_user", 5))
@@ -217,9 +277,9 @@ class VideoComprehensionPlugin(BasePlugin):
         bs = cfg.get("section_bili", {}) or {}
         self.bili_enabled = bs.get("bili_enabled", True)
         self.bili_cookie = bs.get("bili_cookie", "")
-        self.bili_use_ai = bs.get("bili_use_ai_summary", True)
+        self.bili_use_ai = bs.get("bili_use_ai_summary", False)
         self.bili_search_n = int(bs.get("bili_search_count", 5))
-        self.bili_max_dl = int(bs.get("bili_max_download_sec", 600))
+        self.bili_max_dl = int(bs.get("bili_max_download_sec", 1800))
         self.auto_send_link = bs.get("auto_send_link", False)
         # 诊断用：只检测不发送（用于定位"收到链接就崩"是检测阶段还是发送阶段）
         self.auto_send_dry_run = bool(bs.get("auto_send_dry_run", False))
@@ -241,7 +301,9 @@ class VideoComprehensionPlugin(BasePlugin):
 
         us = cfg.get("section_upload", {}) or {}
         self.upload_enabled = bool(us.get("upload_enabled", True))
-        # 多源：upload_hosts（list）优先；兼容旧的 upload_host（string）
+        # 多源：upload_hosts（list）优先；兼容配置里遗留的 upload_host（string）
+        #   ⚠️ 兼容读取要保留（老用户配置里可能只有 upload_host），
+        #      但不必再存一份 self.upload_host —— 那是改造前的死代码。
         hosts = us.get("upload_hosts")
         if hosts is None:
             old = us.get("upload_host")
@@ -250,7 +312,6 @@ class VideoComprehensionPlugin(BasePlugin):
             hosts = [hosts]
         self.upload_hosts = [str(h).strip() for h in (hosts or []) if str(h).strip()] \
             or list(DEFAULT_UPLOAD_HOSTS)
-        self.upload_host = self.upload_hosts[0]   # 兼容旧引用
 
         # ── 语音转写（给模型补上"声音"信息） ──
         au = cfg.get("section_audio", {}) or {}
@@ -273,13 +334,172 @@ class VideoComprehensionPlugin(BasePlugin):
         if self.cache_scope not in ("mentioned", "batch", "all"):
             self.cache_scope = "mentioned"
         self.audio_max_blocks = int(au.get("audio_max_blocks", 80) or 80)
-        self.audio_concurrency = max(1, min(16, int(au.get("audio_concurrency", 5) or 5)))
+        self.audio_concurrency = max(1, min(32, int(au.get("audio_concurrency", 10) or 10)))
         self.audio_silence_db = float(au.get("audio_silence_db", -35) or -35)
         self.upload_max_mb = int(us.get("upload_max_mb", 200))
         self.upload_compress_over_mb = int(us.get("upload_compress_over_mb", 20))
         self.upload_timeout = int(us.get("upload_timeout_sec", 300))
         self.upload_keep_name = bool(us.get("upload_keep_name", True))
         self.upload_use_proxy = bool(us.get("upload_use_proxy", False))
+
+        # ── 异步与并发（v1.17.0） ──
+        ac = cfg.get("section_async", {}) or {}
+        self.async_analyze = bool(ac.get("async_analyze", True))
+        self.async_followup = bool(ac.get("async_followup", False))
+        self.max_parallel_per_chat = max(1, min(10, int(ac.get("max_parallel_per_chat", 3) or 3)))
+        self.max_parallel_global = max(0, min(32, int(ac.get("max_parallel_global", 6) or 0)))
+        self.queue_timeout_sec = max(0, int(ac.get("queue_timeout_sec", 600) or 0))
+        self.analysis_budget_sec = max(1, int(ac.get("analysis_budget_sec", 200) or 200))
+        self.pipeline_hard_timeout_sec = max(0, int(ac.get("pipeline_hard_timeout_sec", 0) or 0))
+        try:
+            self.notice_coalesce_sec = max(0.0, float(ac.get("notice_coalesce_sec", 2.0) or 0))
+        except (TypeError, ValueError):
+            self.notice_coalesce_sec = 2.0
+        self.task_keep_minutes = max(1, int(ac.get("task_keep_minutes", 30) or 30))
+
+    # ── 配置自动迁移（只做一次，原子安全） ──
+
+    # (标记名, section, key, 旧默认值, 新默认值)
+    _CONFIG_MIGRATIONS = (
+        ("bili_max_download_sec_600_to_1800", "section_bili", "bili_max_download_sec", 600, 1800),
+        ("audio_concurrency_5_to_10", "section_audio", "audio_concurrency", 5, 10),
+    )
+
+    def _migration_marker_path(self) -> str:
+        """迁移标记写在**插件自己的数据目录**，不碰框架的配置文件结构。"""
+        try:
+            base = Path(self.ctx.get_plugin_data_dir())
+        except Exception as e:
+            logger.warning("[VC] 无法定位插件数据目录，跳过配置迁移: %s", e)
+            return ""
+        return str(base / "config_migrations.json")
+
+    def _migrate_config(self, cfg: dict) -> None:
+        """把「用户从未改过的」旧默认值升级到新默认值。
+
+        为什么不能靠「当前值 == 旧默认」判断：框架在启动时会把 schema 里所有
+        缺失的 key 补成默认值（plugin_registry._ensure_plugin_config），
+        所以配置文件里一定有这两个 key —— 光看值分不清「用户改的 600」和
+        「一直是默认的 600」。因此必须带标记，且**先写标记、后应用**：
+        万一写标记失败，宁可这次不迁移，也绝不会二次覆盖用户的手动修改。
+        """
+        marker_path = self._migration_marker_path()
+        if not marker_path:
+            return
+
+        # 1) 读标记（损坏 → 视为空，并告警）
+        marks: dict = {}
+        try:
+            if os.path.isfile(marker_path):
+                with open(marker_path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    marks = loaded
+        except Exception as e:
+            logger.warning("[VC] 配置迁移标记读取失败（将按未迁移处理）: %s", e)
+
+        # 2) 挑出「未标记」且「当前值 == 旧默认」的迁移项
+        pending = []
+        for name, section, key, old_default, new_default in self._CONFIG_MIGRATIONS:
+            if marks.get(name):
+                self._migrated_keys.add(f"{section}.{key}")
+                continue
+            sec = cfg.get(section)
+            if not isinstance(sec, dict) or key not in sec:
+                continue                       # 用户配置里没这一项 → 无需迁移
+            try:
+                cur = int(sec.get(key))
+            except (TypeError, ValueError):
+                continue
+            if cur == old_default:
+                pending.append((name, section, key, old_default, new_default))
+
+        if not pending:
+            return
+
+        # 3) 先写标记（原子）—— 顺序不能反
+        try:
+            for name, section, key, old_default, new_default in pending:
+                marks[name] = {"at": int(time.time()), key: new_default}
+            self._atomic_write_json(marker_path, marks)
+        except Exception as e:
+            logger.warning("[VC] 配置迁移标记写入失败，本次不迁移（下次启动再试）: %s", e)
+            return
+
+        # 4) 再改内存配置
+        applied = []
+        for name, section, key, old_default, new_default in pending:
+            cfg.setdefault(section, {})[key] = new_default
+            self._migrated_keys.add(f"{section}.{key}")
+            applied.append(f"{key} {old_default} → {new_default}")
+
+        # 5) 原子写回插件配置（保留其它字段；失败只告警，不影响插件加载）
+        try:
+            self._persist_plugin_cfg(cfg)
+            logger.info("[VC] 配置迁移完成（仅迁移未修改过的项）：%s；已标记，不会重复迁移",
+                        "，".join(applied))
+        except Exception as e:
+            logger.warning("[VC] 配置迁移已生效但写回失败（本次运行仍用新值）: %s", e)
+
+    @staticmethod
+    def _atomic_write_json(path: str, data: dict) -> None:
+        """tmp + os.replace 原子写，避免写一半把配置搞坏。"""
+        d = os.path.dirname(path)
+        if d:
+            os.makedirs(d, exist_ok=True)
+        tmp = f"{path}.tmp.{os.getpid()}"
+        with open(tmp, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=4, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, path)
+
+    def _persist_plugin_cfg(self, cfg: dict) -> None:
+        """把插件配置写回 data/config/plugins/{plugin_id}.json（原子）。
+
+        ⚠️ 只改内容、不改结构：先读盘上现有内容并合并（以盘上为准做基底，
+        用我们的改动覆盖），这样即使是并行更新也不会丢掉别人的字段。
+        """
+        path = self._plugin_cfg_path()
+        if not path:
+            return
+        on_disk: dict = {}
+        try:
+            if os.path.isfile(path):
+                with open(path, "r", encoding="utf-8") as f:
+                    loaded = json.load(f)
+                if isinstance(loaded, dict):
+                    on_disk = loaded
+        except Exception as e:
+            logger.warning("[VC] 读取插件配置失败，跳过写回: %s", e)
+            return
+
+        merged = dict(on_disk)
+        for section, values in cfg.items():
+            if isinstance(values, dict) and isinstance(merged.get(section), dict):
+                merged[section] = {**merged[section], **values}
+            else:
+                merged[section] = values
+        self._atomic_write_json(path, merged)
+
+    def _plugin_cfg_path(self) -> str:
+        """定位框架的插件配置文件 data/config/plugins/{plugin_id}.json"""
+        try:
+            base = Path(get_data_path()) / "config" / "plugins"
+        except Exception:
+            return ""
+        pid = ""
+        try:
+            import json as _json
+            mf = os.path.join(_PLUGIN_DIR, "manifest.json")
+            if os.path.isfile(mf):
+                with open(mf, "r", encoding="utf-8") as f:
+                    pid = str((_json.load(f) or {}).get("plugin_id") or "")
+        except Exception:
+            pid = ""
+        if not pid:
+            pid = os.path.basename(_PLUGIN_DIR)
+        return str(base / f"{pid}.json")
 
 
     async def _ensure_ffmpeg_async(self):
@@ -408,15 +628,44 @@ class VideoComprehensionPlugin(BasePlugin):
         await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache, self.bili_cleanup, "B站")
         await self._do_cleanup(self.other_cache_dir, self.other_max_cache, self.other_cleanup, "其他")
         self._cleanup = asyncio.create_task(self._cleanup_loop())
-        logger.info("[VC] 分析=%s B站=%s | B站缓存=%s | 其他缓存=%s",
+        # 并发闸（按当前配置重建）
+        self._rebuild_gates()
+        logger.info("[VC] 分析=%s B站=%s | 异步分析=%s(追问异步=%s) | 并发=%d/会话 %s/全局 | 软预算=%ds",
                      self.video_analysis_enabled, self.bili_enabled,
-                     self.bili_cache_dir, self.other_cache_dir)
+                     self.async_analyze, self.async_followup,
+                     self.max_parallel_per_chat,
+                     self.max_parallel_global or "∞", self.analysis_budget_sec)
+        if self.video_analysis_enabled and self.async_analyze:
+            logger.info("[VC] ℹ️ 异步分析已启用：本插件的时间与框架「工具调用超时」相互独立，"
+                        "即使框架工具超时小于本插件软预算（%ds）也不受影响（工具毫秒级返回）",
+                        self.analysis_budget_sec)
+        if self.bili_use_ai and not self.bili_cookie:
+            logger.info("[VC] ℹ️ 已开启「优先B站AI总结」但未配置 B站 Cookie："
+                        "该接口需要登录态才会返回内容，多数情况下会白跑一次请求再降级，可考虑关闭")
 
     async def terminate(self):
         if self._cleanup and not self._cleanup.done():
             self._cleanup.cancel()
             try: await self._cleanup
             except asyncio.CancelledError: pass
+        # 取消所有后台分析任务与待合并通告
+        for t in list(self._tasks.values()):
+            if t.asyncio_task and not t.asyncio_task.done():
+                t.cancel_requested = True
+                t.asyncio_task.cancel()
+            if t.queue_timer and not t.queue_timer.done():
+                t.queue_timer.cancel()
+        self._tasks.clear()
+        for nt in list(self._notice_tasks):
+            if not nt.done():
+                nt.cancel()
+        self._notice_tasks.clear()
+        for bt in list(self._background_tasks):
+            if not bt.done():
+                bt.cancel()
+        self._background_tasks.clear()
+        self._notice_buffer.clear()
+        self._flushing.clear()
         self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
         self._cached_videos.clear()
         self._video_failures.clear()
@@ -616,14 +865,494 @@ class VideoComprehensionPlugin(BasePlugin):
         lst = self._sid_sessions[sid]
         if sess.session_id in lst: lst.remove(sess.session_id)
         lst.insert(0, sess.session_id)
-        if len(lst) > self.max_session_per_user:
-            old = lst.pop(); self._sessions.pop(old, None)
+        # M3：超上限时不直接销毁，而是「降级保留」——把内存里最贵的拼图丢掉，
+        #     但留下分析结果/历史/转写，这样追问仍然可用（只是不能再问画面细节），
+        #     否则第 6 个视频一来，第 1 个的会话连追问都直接 404。
+        while len(lst) > self.max_session_per_user:
+            old_id = lst.pop()
+            old = self._sessions.get(old_id)
+            if old is None:
+                continue
+            if old.grids_base64:
+                old.grids_base64 = []
+                old.analysis_mode = (old.analysis_mode or "") + "(已降级:拼图已回收)"
+                logger.info("[VC] 会话 %s 超出保留上限，已回收拼图（分析文本仍可用于追问）",
+                            old_id)
+            else:
+                self._sessions.pop(old_id, None)
 
     def _get_by_session_id(self, sid):
         return self._sessions.get(sid)
 
     def _list_sessions(self, sid):
         return [self._sessions[s] for s in self._sid_sessions.get(sid, []) if s in self._sessions]
+
+    def _session_lock(self, key: str) -> asyncio.Lock:
+        """按 key 串行化（M4：原先 _locks 定义了却从未使用）。
+
+        用于「同一会话 + 同一视频」的并发重活（时间段分析要写同一个 work 父目录），
+        避免两个任务同时写盘互相踩。不同 key 之间互不影响。
+        """
+        lock = self._locks.get(key)
+        if lock is None:
+            lock = asyncio.Lock()
+            self._locks[key] = lock
+        # 顺手清理无人持有的锁，避免长期运行后无限增长
+        if len(self._locks) > 512:
+            for k in [k for k, v in self._locks.items()
+                      if not v.locked() and k != key][:256]:
+                self._locks.pop(k, None)
+        return lock
+
+    # ══════════════════════════════════════════════════════════════
+    #  异步分析任务系统（v1.17.0）
+    #
+    #  脱钩三重保证：
+    #    L1 提交路径：工具只建任务即返回，永不 await 分析体（毫秒级）
+    #    L2 计时干扰：分析重活全部离开事件循环（to_thread / executor），
+    #                 否则会拖住全局计时器（包括框架的工具超时）
+    #    L3 软预算  ：即使工具协程被框架取消，任务依然存活并最终通告
+    # ══════════════════════════════════════════════════════════════
+
+    def _rebuild_gates(self):
+        """按当前配置重建并发闸（仅用于分析任务；追问不计入）
+
+        用「显式计数 + 事件唤醒」而不是 Semaphore：因为提交时要**同步地**
+        判断这次是「立即开跑」还是「排队」，Semaphore 的 acquire 是异步的，
+        提交瞬间读到的状态会误导文案（曾导致首次分析被误报成「已排队」）。
+        """
+        self._chat_running.clear()
+        self._global_running = 0
+        self._slot_events: dict[str, asyncio.Event] = {}
+        if not hasattr(self, "_slot_events") or self._slot_events is None:
+            self._slot_events = {}
+
+    def _slot_event(self, sid: str) -> asyncio.Event:
+        e = self._slot_events.get(sid)
+        if e is None:
+            e = asyncio.Event()
+            self._slot_events[sid] = e
+        return e
+
+    def _try_reserve(self, sid: str) -> bool:
+        """同步尝试占一个分析槽（成功返回 True 并已计数）"""
+        if self._running_count(sid) >= self.max_parallel_per_chat:
+            return False
+        if self.max_parallel_global > 0 and self._global_running >= self.max_parallel_global:
+            return False
+        self._chat_running[sid] = self._running_count(sid) + 1
+        self._global_running += 1
+        return True
+
+    def _release_slot(self, sid: str):
+        if self._running_count(sid) > 0:
+            self._chat_running[sid] = self._running_count(sid) - 1
+        if self._global_running > 0:
+            self._global_running -= 1
+        ev = self._slot_events.get(sid)
+        if ev is not None:
+            ev.set()
+
+    def _new_task_id(self, sid: str) -> str:
+        n = int(self._task_seq.get(sid, 0)) + 1
+        self._task_seq[sid] = n
+        return f"V{n % 10000}"
+
+    def _spawn(self, coro, name: str = "") -> asyncio.Task:
+        """创建后台任务并持有强引用（否则可能被 GC 提前回收）。"""
+        t = asyncio.create_task(coro, name=name or "vc_bg")
+        self._background_tasks.add(t)
+        t.add_done_callback(self._background_tasks.discard)
+        return t
+
+    def _running_count(self, sid: str) -> int:
+        return int(self._chat_running.get(sid, 0))
+
+    def _task_desc_line(self, task: VideoTask) -> str:
+        parts = [f"任务号: {task.task_id}"]
+        if task.title:
+            t = task.title
+            parts.append(t if t.startswith("《") else f"《{t}》")
+        if task.detail and task.detail != task.title:
+            parts.append(task.detail)
+        return " | ".join(parts)
+
+    def _prune_tasks(self):
+        """清理过期任务记录（只在完成态里挑）"""
+        cutoff = time.time() - self.task_keep_minutes * 60
+        for tid in [k for k, v in self._tasks.items()
+                    if v.state in ("done", "failed", "rejected", "cancelled")
+                    and (v.finished_at or v.created_at) < cutoff]:
+            self._tasks.pop(tid, None)
+
+    # ── 提交（L1：永不阻塞） ──
+
+    def _submit_task(self, sid: str, kind: str, title: str, detail: str,
+                     runner, dup_key: str = "") -> VideoTask:
+        """建任务并立刻返回。runner 是真正的执行体（callable → coroutine）。
+
+        并发闸：只对 first / segment 生效；followup 直接执行（你的决策）。
+        """
+        self._prune_tasks()
+        task = VideoTask(self._new_task_id(sid), sid, kind, title, detail, dup_key=dup_key)
+        self._tasks[task.task_id] = task
+
+        if kind == "followup":
+            task.state = "running"
+            task.started_at = time.time()
+            task.progress = "正在回答追问"
+            task.reserved = False
+            task.asyncio_task = self._spawn(self._run_task(task, runner, use_gate=False),
+                                            name=f"vc_task_{task.task_id}")
+            return task
+
+        # 关键：**同步**决定「立即开跑」还是「排队」，让文案与事实一致
+        if self._try_reserve(sid):
+            task.state = "running"
+            task.started_at = time.time()
+            task.progress = "正在处理"
+            task.reserved = True
+        else:
+            task.state = "queued"
+            task.progress = "已排队"
+            task.reserved = False
+        task.asyncio_task = self._spawn(self._run_task(task, runner, use_gate=True),
+                                        name=f"vc_task_{task.task_id}")
+        # 排队超时看门狗
+        if task.state == "queued" and self.queue_timeout_sec > 0:
+            task.queue_timer = self._spawn(self._queue_watchdog(task),
+                                           name=f"vc_queue_{task.task_id}")
+        return task
+
+    async def _queue_watchdog(self, task: VideoTask):
+        try:
+            await asyncio.sleep(self.queue_timeout_sec)
+        except asyncio.CancelledError:
+            return
+        if task.state != "queued":
+            return
+        # 排队超时 → 拒绝该任务（不静默丢失）
+        task.state = "rejected"
+        task.error = (f"本会话已有 {self.max_parallel_per_chat} 个视频在分析"
+                      f"（每会话上限 {self.max_parallel_per_chat}），"
+                      f"排队等待超过 {self.queue_timeout_sec} 秒仍未轮到")
+        task.finished_at = time.time()
+        task.progress = "排队超时未执行"
+        if task.asyncio_task and not task.asyncio_task.done():
+            task.asyncio_task.cancel()
+        await self._notify_done(task)
+
+    async def _run_task(self, task: VideoTask, runner, use_gate: bool):
+        """任务执行体：等待槽位（若已占则跳过）→ 跑 runner → 释放 → 通告。
+
+        注意：**不在这里 await 工具协程**。真正调用方是 _await_or_handoff()。
+        """
+        hard_task = None
+        try:
+            if use_gate and not task.reserved:
+                # 排队中：等槽位事件，直到有位置或任务被判超时/取消
+                while task.state == "queued" and not task.cancel_requested:
+                    ev = self._slot_event(task.sid)
+                    ev.clear()
+                    try:
+                        await asyncio.wait_for(ev.wait(), timeout=0.5)
+                    except asyncio.TimeoutError:
+                        pass
+                    if task.state != "queued":
+                        return
+                    if self._try_reserve(task.sid):
+                        task.reserved = True
+                        break
+                if task.state != "queued" or not task.reserved:
+                    return
+                task.state = "running"
+                task.started_at = time.time()
+                task.progress = "正在处理"
+
+            # 硬上限（默认 0 = 不设）：真正的强制中止。
+            # ⚠️ 不能在这里 return —— 那会跳过末尾的 _notify_done，
+            #    失败就再也不会告诉用户。用标记位走到统一收尾。
+            result = None
+            if self.pipeline_hard_timeout_sec > 0:
+                hard_task = asyncio.ensure_future(runner(task))
+                try:
+                    result = await asyncio.wait_for(
+                        asyncio.shield(hard_task),
+                        timeout=self.pipeline_hard_timeout_sec)
+                except asyncio.TimeoutError:
+                    hard_task.cancel()
+                    try:
+                        await hard_task
+                    except (asyncio.CancelledError, Exception):
+                        pass
+                    task.state = "failed"
+                    task.error = (f"超过硬上限 {self.pipeline_hard_timeout_sec} 秒仍未完成，已中止"
+                                  f"（下载 / 抽帧 / 模型响应某一步卡住）")
+                    task.progress = "已中止（超过硬上限）"
+                    task.finished_at = time.time()
+                    logger.warning("[VC] 任务 %s 超过硬上限 %ds，已强制中止",
+                                   task.task_id, self.pipeline_hard_timeout_sec)
+            else:
+                result = await runner(task)
+
+            if task.state == "running":
+                task.state = "done"
+                task.result = result or ""
+                task.finished_at = time.time()
+        except asyncio.CancelledError:
+            if hard_task and not hard_task.done():
+                hard_task.cancel()
+            # ⚠️ 排队看门狗会先把状态标成 rejected 再 cancel 这里 ——
+            #    不能无条件覆盖成 cancelled，否则通告会误报成
+            #    「任务已取消（插件重载或服务关闭）」
+            if task.state not in ("rejected", "failed", "done"):
+                task.state = "cancelled"
+                task.error = task.error or "任务已取消（插件重载或服务关闭）"
+                task.finished_at = task.finished_at or time.time()
+            raise
+        except Exception as e:
+            logger.exception("[VC] 任务 %s 执行异常", task.task_id)
+            task.state = "failed"
+            task.error = f"{type(e).__name__}: {e}"
+            task.finished_at = time.time()
+        finally:
+            # 统一收尾：状态兜底 + 归还槽位 + 取消排队看门狗
+            if task.state == "running":
+                task.state = "failed"
+                task.error = task.error or "任务未正常结束"
+                task.finished_at = time.time()
+            if getattr(task, "reserved", False):
+                self._release_slot(task.sid)
+                task.reserved = False
+            task.slot_released = True
+            if task.queue_timer and not task.queue_timer.done():
+                task.queue_timer.cancel()
+
+        if task.state in ("done", "failed", "rejected"):
+            await self._notify_done(task)
+
+    def _task_summary_line(self, task: VideoTask) -> str:
+        """头部信息行（通告用）"""
+        bits = []
+        if task.title:
+            bits.append(task.title if task.title.startswith("《") else f"《{task.title}》")
+        if task.detail:
+            bits.append(task.detail)
+        return " | ".join(bits)
+
+    # ── 完成通告（合并窗口，减少 LLM 轮次） ──
+
+    async def _notify_done(self, task: VideoTask):
+        """把已完成的任务放进合并缓冲，并在窗口后统一发出。"""
+        if task.notified:
+            return
+        task.notified = True
+        self._notice_buffer.setdefault(task.sid, []).append(task)
+        if self.notice_coalesce_sec <= 0:
+            await self._flush_notices(task.sid)
+            return
+        self._ensure_flush_task(task.sid)
+
+    def _ensure_flush_task(self, sid: str):
+        # 正在 flush 中：它会循环把新到达的任务一并取走，不必再排一个
+        if sid in self._flushing:
+            return
+        name = f"vc_notice_{sid}"
+        for t in list(self._notice_tasks):
+            if t.done():
+                self._notice_tasks.discard(t)
+                continue
+            if t.get_name() == name:
+                return                      # 已有排队的 flush，等它就行
+        nt = self._spawn(self._notice_flush_later(sid), name=name)
+        self._notice_tasks.add(nt)
+        nt.add_done_callback(self._notice_tasks.discard)
+
+    async def _notice_flush_later(self, sid: str):
+        try:
+            await asyncio.sleep(self.notice_coalesce_sec)
+        except asyncio.CancelledError:
+            return
+        await self._flush_notices(sid)
+
+    async def _flush_notices(self, sid: str):
+        """把缓冲里的任务组装成通告并发出去。
+
+        ⚠️ 原先的实现有个竞态：**在 await publish_notice 期间新完成的任务**，
+        因为「同名 flush 任务还没 done」而不会再排 flush ⇒ 那条通知就卡在
+        buffer 里，直到下一次有任务完成才被带出去（用户表现为「早完成了却没有
+        任何消息」）。现在改成：flush 期间循环取走新到达的，收尾再检查一次残留。
+        """
+        if sid in self._flushing:
+            return                          # 已有 flush 在处理这个会话
+        self._flushing.add(sid)
+        try:
+            for _ in range(6):
+                tasks = self._notice_buffer.pop(sid, []) or []
+                if not tasks:
+                    return
+                text = self._compose_notice(tasks)
+                if not text:
+                    continue
+                try:
+                    await self.ctx.publish_notice(sid, MessageChain([Text(text)]),
+                                                  is_mentioned=True)
+                    logger.info("[VC] 已回灌分析完成通告（%d 条任务）→ %s", len(tasks), sid)
+                except Exception:
+                    logger.exception("[VC] 回灌分析通告失败")
+                    return
+        finally:
+            self._flushing.discard(sid)
+        # 极端情况下（持续有新任务）还留了残留 → 再排一次，保证不丢
+        if self._notice_buffer.get(sid):
+            self._ensure_flush_task(sid)
+
+    def _compose_notice(self, tasks: list) -> str:
+        """把一批已完成任务组装成一条通告文本"""
+        done = [t for t in tasks if t.state == "done"]
+        failed = [t for t in tasks if t.state == "failed"]
+        rejected = [t for t in tasks if t.state == "rejected"]
+        cancelled = [t for t in tasks if t.state == "cancelled"]
+        parts = []
+        if done:
+            parts.append(self._notice_success(done))
+        for t in failed:
+            parts.append(self._notice_failure(t))
+        for t in rejected:
+            parts.append(self._notice_rejected(t))
+        if cancelled:
+            parts.append("【系统通知 · 视频分析已取消】\n"
+                         "任务被取消（插件重载或服务关闭）。如果是插件重载导致的，"
+                         "请告知用户稍后重新发起即可。")
+        return "\n\n".join(p for p in parts if p)
+
+    def _notice_success(self, tasks: list) -> str:
+        """成功通告：多条任务合并成一条，避免连开多轮对话。"""
+        head = ["【系统通知 · 视频分析完成】"]
+        for t in tasks:
+            line = f"{t.task_id}: " + (self._task_summary_line(t) or t.kind)
+            line += f" | 用时 {int(t.elapsed)} 秒"
+            if t.session_id:
+                line += f" | session_id={t.session_id}"
+            head.append(line)
+        body = []
+        for t in tasks:
+            if len(tasks) == 1:
+                body.append(t.result)
+            else:
+                body.append(f"—— {t.task_id} ——\n{t.result}")
+        tail = ("用你自己的语气把结果讲给用户听（可精简、可加点评），"
+                "不要提「系统通知/后台任务/任务号」，也不要重发视频。")
+        if any(t.session_id for t in tasks):
+            tail += "用户可用上面的 session_id 继续追问，不必重发。"
+        return "\n".join(head) + "\n━━━\n" + "\n\n".join(body) + "\n━━━\n" + tail
+
+    def _notice_failure(self, task: VideoTask) -> str:
+        reason = task.error or "未知原因"
+        hint = ""
+        low = reason.lower()
+        if "超时" in reason or "timeout" in low:
+            hint = ("建议: 稍后重试；若反复失败，可能是网络问题，"
+                    "或该视频需要登录权限（会员/充电视频需配 B站 Cookie）")
+        elif "cookie" in low or "登录" in reason or "权限" in reason:
+            hint = "建议: 该视频可能需要登录权限，可在插件设置里配置 B站 Cookie 后重试"
+        elif "过大" in reason or "时长" in reason or "上限" in reason:
+            hint = "建议: 换更短的视频，或在「安全限制」里放宽对应上限"
+        elif "模型" in reason or "api" in low or "401" in reason or "403" in reason:
+            hint = "建议: 检查模型组的 API Key / 地址是否正确、余额是否充足"
+        else:
+            hint = "建议: 稍后重试；若反复失败请查看运行日志"
+        text = ("【系统通知 · 视频分析失败】\n"
+                f"{task.task_id}: {self._task_summary_line(task)} | 原因: {reason}\n{hint}\n"
+                "──────────────────────\n"
+                "把原因和建议转述给用户，不要提「系统通知」，也不要立刻反复重试同一个视频。")
+        return text
+
+    def _notice_rejected(self, task: VideoTask) -> str:
+        return ("【系统通知 · 视频分析未执行】\n"
+                f"{task.task_id}: {self._task_summary_line(task)} | 原因: {task.error}\n"
+                "建议: 等前面几个完成后再发一次\n"
+                "──────────────────────\n"
+                "把情况和建议告诉用户。")
+
+    # ── L3：软预算交接 ──
+
+    async def _await_or_handoff(self, task: VideoTask, budget: float):
+        """原地最多等 budget 秒。
+
+        返回 ("done", 结果文本) / ("failed", 错误) / ("handoff", None) 三态 ——
+        **不能用 None 同时表示「失败」和「转后台」**（曾导致分析失败被误报成
+        「还在看，再等一下」，用户永远等不到结果）。
+
+        ⚠️ 排队看门狗在拒绝任务时会 cancel 任务本体，而这里 shield 住的就是它
+        ⇒ 等待会抛 CancelledError。**这时不能往上传**（框架会判成工具失败），
+        要识别成「任务已被拒绝」并正常返回文案。
+        """
+        body = task.asyncio_task
+        if body is None:
+            return ("failed", "任务未启动")
+        waiter = asyncio.shield(body)
+        try:
+            await asyncio.wait_for(waiter, timeout=max(0.1, budget))
+        except asyncio.TimeoutError:
+            task.budget_exceeded = True
+            task.progress = "已超过软预算，转后台继续"
+            logger.info("[VC] 任务 %s 超过软预算 %.0fs，转后台继续（不中断）",
+                        task.task_id, budget)
+            return ("handoff", None)
+        except asyncio.CancelledError:
+            # 区分两种来源：
+            #   ① 任务本体被「排队看门狗」取消 → 这是正常业务结果，正常返回文案
+            #   ② 外层（框架的 wait_for）取消我们 → 任务必须继续活着（L3），往上抛
+            if task.state in ("rejected", "failed", "cancelled"):
+                logger.info("[VC] 任务 %s 已被取消/拒绝，向工具返回明确原因", task.task_id)
+                return ("failed", task.error or "任务未执行")
+            # 框架的 wait_for 掐断了工具协程 —— 任务必须继续活着（L3）
+            task.budget_exceeded = True
+            task.progress = "框架工具超时，已转后台继续"
+            logger.info("[VC] 任务 %s 的工具调用被框架取消，任务已转后台继续（不影响结果）",
+                        task.task_id)
+            raise
+        if task.state == "done":
+            return ("done", task.result)
+        if task.state == "rejected":
+            return ("failed", task.error or "排队超时未执行")
+        return ("failed", task.error or "未知原因")
+
+    # ── 提交文案 ──
+
+    def _ack_submitted(self, task: VideoTask, parallel_now: int) -> str:
+        total = self.max_parallel_per_chat
+        return (
+            f"✅ 已开始分析视频（后台进行）\n"
+            f"{self._task_desc_line(task)}\n"
+            f"本会话并行: {max(1, parallel_now)}/{total}\n"
+            "──────────────────────\n"
+            "正在后台处理（下载 → 抽帧 → 语音转写），完成后结果会自动交给你。\n"
+            "现在只用一两句话告诉用户「正在看，稍等一下」。"
+            "不要猜视频内容、不要重复调用本工具、不要提「后台/系统/任务号」。"
+        )
+
+    def _ack_queued(self, task: VideoTask) -> str:
+        pos = 1 + sum(1 for t in self._tasks.values()
+                      if t.sid == task.sid and t.state == "queued"
+                      and t.created_at < task.created_at)
+        return (
+            f"🕐 已排队（本会话正在分析 {self.max_parallel_per_chat} 个视频，"
+            f"达到上限 {self.max_parallel_per_chat}）\n"
+            f"{self._task_desc_line(task)} | 排队第 {pos} 位"
+            f" | 最长等待 {self.queue_timeout_sec} 秒\n"
+            "──────────────────────\n"
+            "用一句话告诉用户「前面的还在处理，排到了就立刻开始」，不要重复调用本工具。"
+        )
+
+    def _ack_handoff(self, task: VideoTask) -> str:
+        return (
+            f"⏳ 分析仍在进行（已超过 {self.analysis_budget_sec} 秒），已转后台继续，不会中断。\n"
+            f"{self._task_desc_line(task)} | 进度: {task.progress}\n"
+            "──────────────────────\n"
+            "用一句话告诉用户「这个视频比较大，还在看，再等一下」，不要重复调用本工具。"
+        )
 
     # ── 自动发送B站链接（对标音频条 auto_send_link，0 token） ──
 
@@ -720,8 +1449,16 @@ class VideoComprehensionPlugin(BasePlugin):
         if self.auto_send_dry_run:
             logger.info("[VCDIAG] dry_run=开 → 只检测不发送，到此为止")
             return
-        asyncio.create_task(self._auto_send_do(bvid, event.adapter.name, sid,
-                                               match_keys=match_keys, message_id=mid))
+        # N4：后台发送（最长 180 秒）期间，用户若刚好 @bot 问这个视频，
+        #     _pending 里没有条目 → bot 会答「当前无视频」。这里**先占位**，
+        #     发送完成（成功走 _auto_sent 标注、失败则清掉）再交接。
+        if sid not in self._pending:
+            self._pending[sid] = {"url": f"https://www.bilibili.com/video/{bvid}",
+                                  "source": "auto_send", "ts": time.time(),
+                                  "bvid": bvid}
+        self._spawn(self._auto_send_do(bvid, event.adapter.name, sid,
+                                       match_keys=match_keys, message_id=mid),
+                    name="vc_auto_send")
         logger.info("[VCDIAG] 4/6 后台任务已创建（hook 返回，不再占用消息处理）")
 
     async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str,
@@ -750,9 +1487,16 @@ class VideoComprehensionPlugin(BasePlugin):
                 # 失败 → **只记日志，不发到会话里**（自动钩子是后台行为，
                 # 报错刷屏会打扰群聊；要看就去 cmd / 日志里看）
                 logger.warning("[VC] auto_send 未成功: %s", reply)
+                # N4：占位的 _pending 要撤掉，避免 bot 以为有视频可分析
+                pend = self._pending.get(sid) or {}
+                if pend.get("source") == "auto_send" and pend.get("bvid") == bvid:
+                    self._pending.pop(sid, None)
         except Exception as e:
             # 同上：异常也只落日志，不往会话里发消息
             logger.warning("[VC] auto_send 异常: %s", e)
+            pend = self._pending.get(sid) or {}
+            if pend.get("source") == "auto_send" and pend.get("bvid") == bvid:
+                self._pending.pop(sid, None)
 
     # ── 批次阶段缓存（避免群里与 bot 无关的视频也被下载+转写） ──
 
@@ -783,7 +1527,7 @@ class VideoComprehensionPlugin(BasePlugin):
                     f = str(getattr(ele, "file", "") or "")
                     if f.startswith(("http://", "https://")):
                         nm = str(getattr(ele, "name", "") or "")
-                        asyncio.create_task(self._cache_then_transcribe(sid, f, nm))
+                        self._spawn(self._cache_then_transcribe(sid, f, nm), name="vc_cache")
             except Exception:
                 continue
 
@@ -1068,10 +1812,29 @@ class VideoComprehensionPlugin(BasePlugin):
         """缓存视频后立刻并行启动转写（这样 bot 真要分析时通常已算好）
 
         若当前启用的模型组**全部**自带音视频理解（不需要 STT），就不再跑 ASR。
+
+        ⚠️ 统一挂在「后台任务闸」下（S2）：原先裸 create_task，群里连发多个视频
+        会同时开多路下载 + 多路 ffmpeg + 多路 ASR 切片，把 CPU/带宽打满。
         """
-        path = await self._cache_incoming_video(sid, url, name)
-        if path:
-            self._start_transcript_task(path, skip_asr=not self._any_group_needs_stt())
+        async with self._bg_gate():
+            path = await self._cache_incoming_video(sid, url, name)
+            if path:
+                self._start_transcript_task(path, skip_asr=not self._any_group_needs_stt())
+
+    def _bg_gate(self):
+        """后台重活的统一并发闸（缓存 / 转写）。
+
+        与分析任务的闸分开：这两类是被动触发的（收到视频就缓存），
+        不能让它们把「分析任务的槽」占满，否则用户主动发起的分析会排队。
+        上限取 max(2, 每会话并发数)，避免连发视频时同时开太多路。
+        """
+        if self._bg_sem is None or self._bg_sem_limit != self._bg_limit():
+            self._bg_sem = asyncio.Semaphore(self._bg_limit())
+            self._bg_sem_limit = self._bg_limit()
+        return self._bg_sem
+
+    def _bg_limit(self) -> int:
+        return max(2, min(16, self.max_parallel_per_chat * 2))
 
     # ── 语音转写（把"声音"变成模型读得到的文字） ──
 
@@ -1382,7 +2145,7 @@ class VideoComprehensionPlugin(BasePlugin):
             if self.auto_cache_video:
                 if str(url).startswith(("http://", "https://")):
                     if self.cache_scope == "all":
-                        asyncio.create_task(self._cache_then_transcribe(sid, url, vname))
+                        self._spawn(self._cache_then_transcribe(sid, url, vname), name="vc_cache")
                 elif os.path.isfile(url):
                     self._remember_cached(sid, os.path.basename(url), url)
 
@@ -1633,10 +2396,15 @@ class VideoComprehensionPlugin(BasePlugin):
         description=("分析视频内容。支持QQ视频/B站视频/本地路径。首次返回session_id，追问传回。"
                      "只看某一段时间就传 start_sec/end_sec（数字秒）；一次看多段传 segments=[[起,止],...]（最多5段、每段≤300秒）。"
                      "时间段分析会复用已下载的视频，不会重新下载。"
+                     "【重要】首次分析是**后台进行**的：本工具会立刻返回一句「已开始分析」，"
+                     "你这时只要告诉用户「正在看，稍等一下」即可，**绝对不要猜测或编造视频内容**；"
+                     "分析完成后系统会把结果送给你，那时再正式回答用户。"
+                     "追问（带 session_id）是同步的，直接拿结果回答即可。"
                      "用户指定了模型（如「用 Agnes 分析」）就传 model=那个名字；"
                      "**同一次对话里后续的每次调用（包括追问）都要继续带上同一个 model**，"
                      "否则会退回默认模型组、可能答非所问。"
-                     "不确定有哪些可选就先不传，传错时返回值会列出全部模型组。"),
+                     "不确定有哪些可选就先不传，传错时返回值会列出全部模型组。"
+                     "同一个视频不要重复调用本工具——若已在分析中，返回值会告诉你。"),
         params={
             "type": "object",
             "properties": {
@@ -1661,6 +2429,12 @@ class VideoComprehensionPlugin(BasePlugin):
                              session_id: str = "",
                              start_sec: float = 0, end_sec: float = 0,
                              segments=None, model: str = "") -> str:
+        """提交入口（L1：永不阻塞）。
+
+        这里只做「参数校验 + 立即返回的轻量查询」，任何重活都交给后台任务。
+        这样工具调用毫秒级返回，既不在主 LLM 链路上阻塞，也不受框架
+        「工具调用超时」限制。
+        """
         if not self.video_analysis_enabled:
             return "⚠️ 视频分析功能已关闭，可在 WebUI 启用"
 
@@ -1676,17 +2450,27 @@ class VideoComprehensionPlugin(BasePlugin):
         sid = self._sid(event)
         if not sid: return "无法获取会话ID"
 
+        # ① 已有 session_id：轻量分支（不下载、不抽帧）
         if session_id:
             sess = self._get_by_session_id(session_id)
             if not sess: return f"⚠️ session_id={session_id} 不存在"
             self._register_session(sess, sid)
-            if segs: return await self._segment_analyze(sess, question, segs, profile_spec)
-            if question: return await self._followup(sess, question, profile_spec)
+            if segs:
+                # 时间段分析要重新抽帧 → 按首次分析处理（占并发槽、可异步）
+                return await self._submit_or_run(
+                    sid, "segment", segs=segs, question=question,
+                    model_spec=profile_spec, sess=sess,
+                    title=sess.title, detail=f"时间段 {self._seg_label(segs)}")
+            if question:
+                return await self._submit_or_run(
+                    sid, "followup", question=question, model_spec=profile_spec,
+                    sess=sess, title=sess.title)
             return (f"📌 session_id={session_id}\n🤖 {sess.analysis_model}\n"
                     f"{self._link_line(sess.host_url)}━━━\n{sess.analysis[:500]}\n━━━\n"
                     f"追问用 session_id=\"{session_id}\"")
 
-        source_url = ""; source_type = ""
+        # ② 解析来源（只有 b23 短链解析与本地路径检查会 await，都是轻量网络/文件操作）
+        source_url = ""; source_type = ""; bvid = bvid or ""
 
         if bvid:
             bvid = bvid.strip()
@@ -1723,34 +2507,262 @@ class VideoComprehensionPlugin(BasePlugin):
                     olds = self._list_sessions(sid)
                     if olds:
                         cur = olds[0]
-                        if question: return await self._followup(cur, question, profile_spec)
+                        # 有历史会话但没指视频 → 当作追问（轻量）
+                        if question:
+                            return await self._submit_or_run(
+                                sid, "followup", question=question,
+                                model_spec=profile_spec, sess=cur, title=cur.title)
                         return (f"🔁 已有{len(olds)}个历史，最新session_id={cur.session_id}\n"
                                 f"🤖 {cur.analysis_model}\n{self._link_line(cur.host_url)}━━━\n"
                                 f"{cur.analysis[:300]}\n━━━\n追问用 session_id=\"{cur.session_id}\"")
                     return "当前无视频"
 
+        # ③ 同一视频已有会话
         sess_id = hashlib.md5(source_url.encode()).hexdigest()[:12]
         if sess_id in self._sessions:
             cur = self._sessions[sess_id]
             self._register_session(cur, sid)
-            if segs: return await self._segment_analyze(cur, question, segs, profile_spec)
-            if question: return await self._followup(cur, question, profile_spec)
+            if segs:
+                return await self._submit_or_run(
+                    sid, "segment", segs=segs, question=question,
+                    model_spec=profile_spec, sess=cur,
+                    title=cur.title, detail=f"时间段 {self._seg_label(segs)}")
+            if question:
+                return await self._submit_or_run(
+                    sid, "followup", question=question, model_spec=profile_spec,
+                    sess=cur, title=cur.title)
             if deep_analysis and cur.analysis_mode == "AI_summary" and not cur.grids_base64:
-                return await self._deep(cur)
+                return await self._submit_or_run(
+                    sid, "first", deep=True, question=question,
+                    model_spec=profile_spec, sess_id=sess_id, source_url=source_url,
+                    source_type="bilibili", bvid=bvid,
+                    title=cur.title, detail="深度补充分析")
             return (f"🔁 已有分析\n📌 session_id={sess_id}\n🤖 {cur.analysis_model}\n"
                     f"{self._link_line(cur.host_url)}━━━\n{cur.analysis[:400]}\n━━━\n"
                     f"追问用 session_id=\"{sess_id}\"")
 
-        if source_type == "bilibili" and self.bili_use_ai and not deep_analysis and not segs:
+        # ④ 首次分析（重活）→ 提交后台
+        # 标题：B站此刻只有 BV 号（真实标题要等下载后才知道），先给个可读的标识；
+        #      通告里会用后台拿到的真实标题覆盖。
+        title = ""
+        detail = ""
+        if source_type == "bilibili":
+            title = bvid
+            detail = "B站视频"
+        else:
+            title = os.path.basename(source_url) or "视频"
+            # 本地/QQ 视频：尽量用缓存里记录的原始文件名（更可读）
+            for c in (self._cached_videos.get(sid) or [])[::-1]:
+                if c.get("path") == source_url and c.get("orig_name"):
+                    title = str(c["orig_name"]); break
+            detail = ""
+        return await self._submit_or_run(
+            sid, "first", question=question, model_spec=profile_spec,
+            sess_id=sess_id, source_url=source_url, source_type=source_type,
+            bvid=bvid, deep=deep_analysis, segments=segs,
+            title=title, detail=detail)
+
+    @staticmethod
+    def _seg_label(segs) -> str:
+        if not segs:
+            return ""
+        if len(segs) == 1:
+            return f"{_ts(segs[0][0])}-{_ts(segs[0][1])}"
+        return f"{len(segs)} 段"
+
+    async def _submit_or_run(self, sid: str, kind: str, **kw) -> str:
+        """决定「同步执行」还是「提交后台」，然后按对应文案返回。
+
+        同步只用于两类轻量场景：
+          - 追问（followup）：拼图已在内存，秒级出结果
+          - 异步开关关闭时的首次/时间段分析（此时用软预算兜住框架超时）
+        """
+        sess = kw.pop("sess", None)
+        title = kw.pop("title", "") or ""
+        detail = kw.pop("detail", "") or ""
+        question = kw.pop("question", "") or ""
+        # 兼容两种调用方写法（segs= 与 segments=），并确保不残留到 **kw
+        segs = kw.pop("segs", None) or kw.pop("segments", None)
+        model_spec = kw.pop("model_spec", None)
+        # 防御：这些键已由具名参数承接，**绝不能**再随 **kw 传下去
+        # （否则会与形参撞名 → TypeError，时间段分析会 100% 失败）
+        for _k in ("segs", "segments", "question", "model_spec", "sess", "title", "detail"):
+            kw.pop(_k, None)
+
+        run_sync = (kind == "followup" and not self.async_followup) \
+            or (kind != "followup" and not self.async_analyze)
+
+        dup_key = self._dup_key_for(kind, kw, sess, segs, question)
+        # 重复调用防护：同一会话同一来源（且同一时间段）已有在跑的任务 → 不重复开跑
+        dup = self._find_duplicate(sid, dup_key)
+        if dup is not None:
+            return (f"ℹ️ 该分析已在后台进行中（任务号 {dup.task_id}），"
+                    f"完成后会自动把结果交给你。\n"
+                    "现在只用一句话告诉用户「已经在看了，稍等一下」，不要重复调用本工具。")
+
+        if run_sync:
+            return await self._run_sync(kind, sid, sess=sess, question=question,
+                                        segs=segs, model_spec=model_spec, **kw)
+
+        # ── 异步提交 ──
+        task = self._submit_task(
+            sid, kind, title, detail,
+            runner=lambda t: self._execute(t, kind, sess=sess, question=question,
+                                           segs=segs, model_spec=model_spec, **kw),
+            dup_key=dup_key)
+        if task.state == "queued":
+            return self._ack_queued(task)
+        return self._ack_submitted(task, self._running_count(sid))
+
+    @staticmethod
+    def _dup_key_for(kind: str, kw: dict, sess, segs=None, question: str = "") -> str:
+        """去重键：同一会话 + 同一来源 + 同一类型（+ 同一时间段 + 同一问题）→ 视为重复调用
+
+        ⚠️ 时间段必须进 key：否则「先看 0~60s、再看 100~160s」会被误判成重复调用，
+        第二个请求直接被拦下（用户换个时间段问就永远得不到回答）。
+        同理，显式问题也要进 key：「看 0~10s」和「看 0~10s 并回答某问题」是两回事。
+        """
+        if kind == "followup":
+            return ""
+        key = kw.get("source_url") or (sess.session_id if sess else "")
+        if not key:
+            return ""
+        parts = [kind, key]
+        if kind == "segment":
+            seg_tag = ",".join(f"{float(s):.0f}-{float(e):.0f}" for s, e in (segs or []))
+            parts.append(seg_tag)
+        if question:
+            parts.append(question.strip()[:80])
+        return ":".join(parts)
+
+    def _find_duplicate(self, sid: str, dup_key: str):
+        """同一会话里是否已有等价任务在跑（防止 bot 重复调用导致重复下载/扣费）"""
+        if not dup_key:
+            return None
+        for t in self._tasks.values():
+            if t.sid != sid or t.state not in ("queued", "running"):
+                continue
+            if t._dup_key and t._dup_key == dup_key:
+                return t
+        return None
+
+    async def _run_sync(self, kind: str, sid: str, sess=None, question: str = "",
+                        segs=None, model_spec=None, **kw) -> str:
+        """同步执行：用 **本插件自己的软预算** 兜住，与框架工具超时脱钩。
+
+        即使被框架 wait_for 掐断，任务也会转后台并最终发通告（实测有效）。
+        """
+        task = self._submit_task(
+            sid, "followup" if kind == "followup" else kind,
+            kw.get("title", "") or (sess.title if sess else ""),
+            kw.get("detail", "") or "",
+            runner=lambda t: self._execute(t, kind, sess=sess, question=question,
+                                           segs=segs, model_spec=model_spec, **kw),
+            dup_key="")
+        # 同步模式下不让它触发「完成通告」，避免与工具返回重复
+        task.notified = True
+        state, payload = await self._await_or_handoff(task, self.analysis_budget_sec)
+        if state == "handoff":
+            # 超预算 / 被框架取消 → 已转后台，恢复通告（结果仍要交回）
+            task.notified = False
+            if task.state in ("done", "failed", "rejected"):
+                await self._notify_done(task)
+            return self._ack_handoff(task)
+        if state == "done" and payload:
+            return payload
+        return self._sync_fail_text(payload)
+
+    @staticmethod
+    def _sync_fail_text(reason: str) -> str:
+        """同步路径失败文案：区分「排队没排上」与「真失败」，别一律说失败"""
+        reason = reason or "未知原因"
+        if "排队" in reason or "仍未轮到" in reason:
+            return (f"🕐 本次没有执行：{reason}\n"
+                    "请把情况告诉用户（前面的还在处理），让他稍后再发一次。")
+        return f"⚠️ 分析失败：{reason}\n请把原因转述给用户。"
+
+    async def _execute(self, task: VideoTask, kind: str, sess=None, question: str = "",
+                       segs=None, model_spec=None, **kw) -> str:
+        """真正的执行体（跑在独立 Task 上；重活已在 video_processor 里离开事件循环）。"""
+        task.progress = "正在解析视频来源"
+        if kind == "followup":
+            task.progress = "正在回答追问"
+            return await self._followup(sess, question, model_spec)
+        if kind == "segment":
+            task.progress = "正在按时间段抽帧分析"
+            task.session_id = sess.session_id if sess else ""
+            return await self._segment_analyze(sess, question, segs, model_spec)
+
+        # first
+        sess_id = kw.get("sess_id") or ""
+        source_url = kw.get("source_url") or ""
+        source_type = kw.get("source_type") or "local"
+        bvid = kw.get("bvid") or ""
+        deep = bool(kw.get("deep"))
+
+        # 本地已有缓存就直接用（M1：避免同一视频下载两次）
+        source_url, source_type, bvid = self._prefer_local(source_url, source_type, bvid,
+                                                           task.sid)
+
+        task.progress = "正在获取视频信息"
+        if source_type == "bilibili" and self.bili_use_ai and not deep and not segs:
             try:
                 info = await get_bili_info(bvid, self.bili_cookie)
+                if info.get("title"):
+                    task.title = str(info["title"])
                 ai = await get_ai_summary(bvid, info["cid"], info.get("up_mid", 0), self.bili_cookie)
-                if ai.get("has_summary"): return self._build_ai_result(sess_id, sid, source_url, info, ai)
-            except Exception as e: logger.info("[VC] B站AI降级: %s", e)
+                if ai.get("has_summary"):
+                    task.session_id = sess_id
+                    task.progress = "已完成（B站AI总结）"
+                    return self._build_ai_result(sess_id, task.sid, source_url, info, ai)
+            except Exception as e:
+                logger.info("[VC] B站AI降级: %s", e)
+        elif source_type == "bilibili":
+            # 即使不走 AI 总结，也先把真实标题拿到，通告里更好读
+            try:
+                info = await get_bili_info(bvid, self.bili_cookie)
+                if info.get("title"):
+                    task.title = str(info["title"])
+            except Exception:
+                pass
 
-        return await self._vision(sess_id, sid, source_type, source_url, bvid,
-                                   question or "请完整分析这段视频", segments=segs,
-                                   model_spec=profile_spec)
+        task.progress = "正在下载 / 抽帧 / 转写"
+        task.session_id = sess_id
+        return await self._vision(sess_id, task.sid, source_type, source_url, bvid,
+                                  question or "请完整分析这段视频", segments=segs,
+                                  model_spec=model_spec)
+
+    def _prefer_local(self, source_url: str, source_type: str, bvid: str, sid: str):
+        """若本地已有该视频缓存，直接复用本地文件（省一次完整下载）。
+
+        M1：原先收视频时缓存到 other_cache_dir，分析时 process_video 又走 URL
+        分支下一份 —— 同一个视频下载两次。
+
+        ⚠️ 关键：**只对「非 B站」来源做这个替换**。
+        B站来源一旦改成 local，`_vision` 就走不到 `stype == "bilibili"` 分支，
+        会连带丢掉 **B站官方字幕（cid 也拿不到）、AI 总结、真实标题**。
+        B站的「不重复下载」由 `download_bili_video` 自己处理
+        （文件已存在且非空就直接返回，见 bili_dl.py:283），不需要在这里替换。
+        """
+        try:
+            if source_type != "bilibili" and source_url.startswith(("http://", "https://")):
+                # 自动缓存过的文件（按原始文件名后缀匹配）
+                name = os.path.basename(source_url.split("?")[0]) or ""
+                if name:
+                    hit = self._find_cached(name)
+                    if hit:
+                        logger.info("[VC] 复用已缓存的视频: %s", os.path.basename(hit))
+                        return hit, "local", bvid
+                # 会话最近的缓存里找（同一个视频被反复引用时最有效）
+                for c in (self._cached_videos.get(sid) or [])[::-1]:
+                    p = c.get("path") or ""
+                    if p and os.path.isfile(p) and c.get("orig_name") and \
+                            c["orig_name"] in source_url:
+                        logger.info("[VC] 复用会话缓存的视频: %s", os.path.basename(p))
+                        return p, "local", bvid
+        except Exception as e:
+            logger.debug("[VC] 本地复用检查失败: %s", e)
+        return source_url, source_type, bvid
 
     # ── 模型组选择（支持按别名/模型名/组号指定） ──
 
@@ -1834,8 +2846,12 @@ class VideoComprehensionPlugin(BasePlugin):
 
         norm = []
         for s, e in raw:
+            # N1：负数结束时间是笔误，不能悄悄当成「到结尾」
+            if e < 0:
+                return None, (f"时间段非法：结束时间 {e:.0f} 为负数。"
+                              f"要去掉结束限制请传 0，而不是负数")
             s = max(0.0, s)
-            if e <= 0: e = 1e9        # 到结尾，稍后按视频时长截断
+            if e == 0: e = 1e9        # 到结尾，稍后按视频时长截断
             if e <= s:
                 return None, f"时间段非法：{s:.0f}~{e:.0f}（结束必须大于开始）"
             if e < 1e9 and (e - s) > MAX_SEGMENT_SEC:
@@ -1867,6 +2883,30 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 视觉分析（非B站视频存到 other_cache_dir） ──
 
+    def _reject_hint(self, result: dict) -> str:
+        """把「拒绝处理」翻译成带**可操作建议**的文案。
+
+        ⚠️ 这里用上了 `max_duration_auto`：当上限是「自动跟随模型组」时，
+        用户看到「时长超上限」会不知道去哪调（他可能压根没设过这个值）。
+        明确告诉他「这是自动跟随来的、去哪个模型组调」才有用。
+        """
+        err = str(result.get("error") or "无法处理")
+        hint = ""
+        if "时长" in err:
+            if self.max_duration_auto:
+                tops = sorted({p.max_video_sec for p in self._profiles}, reverse=True)
+                hint = (f"\n💡 当前时长上限 {self.max_duration}s 是**自动跟随**"
+                        f"（取已启用模型组里最大的 max_video_sec：{tops[:3]}）。"
+                        f"想放宽就去「模型组 N → 最大视频时长」调大，"
+                        f"或在「安全限制 → 最大视频时长」手填一个更大的值。")
+            else:
+                hint = (f"\n💡 时长上限 {self.max_duration}s 是你在「安全限制 → "
+                        f"最大视频时长」手填的，改那里即可（填 0 = 自动跟随模型组）。")
+        elif "过大" in err:
+            hint = (f"\n💡 大小上限 {self.max_file_mb}MB 可在"
+                    f"「安全限制 → 最大视频文件大小」调整。")
+        return f"⚠️ {err}{hint}"
+
     async def _vision(self, sess_id, sid, stype, surl, bvid, question,
                       segments=None, model_spec=None):
         if not self._profiles: return "未配置模型"
@@ -1883,29 +2923,36 @@ class VideoComprehensionPlugin(BasePlugin):
                 pass
         elif stype == "local" and os.path.isfile(surl):
             try:
-                from video_processor import _get_video_info
-                duration_hint = float(_get_video_info(surl).get("duration") or 0) or self.max_duration
+                from video_processor import get_video_info_async
+                duration_hint = float((await get_video_info_async(surl)).get("duration") or 0) \
+                    or self.max_duration
             except Exception:
                 pass
         profile = model_spec or select_model(self._profiles, duration_hint, self.default_model)
         if not profile: return "无合适模型"
 
+        # N5：work 目录带会话+随机后缀，避免同会话并发任务（或同一视频被重复分析）
+        #     写同一个目录互相踩（原来只用 sess_id 命名）
+        _wsuf = uuid.uuid4().hex[:6]
         info = {}          # B 站分支会填上 cid 等（供字幕获取用）
         if stype == "bilibili" and bvid:
             # B站: 源文件存在 bili_cache_dir
             os.makedirs(self.bili_cache_dir, exist_ok=True)
             try:
-                raw_path, info = await download_bili_video(bvid, self.bili_cache_dir, cookie=self.bili_cookie,
-                    timeout=self.dl_timeout, max_seconds=self.max_duration,
-                    quality=self.bili_download_quality)
+                # 同一个 BV 号的文件名是固定的（{bvid}.mp4），并发任务若同时下载
+                # 会写同一个文件 → 用按 bvid 的锁串行化（不同视频之间仍可并行）
+                async with self._session_lock(f"bili:{bvid}"):
+                    raw_path, info = await download_bili_video(bvid, self.bili_cache_dir, cookie=self.bili_cookie,
+                        timeout=self.dl_timeout, max_seconds=self.max_duration,
+                        quality=self.bili_download_quality)
             except Exception as e: return f"⚠️ 下载失败：{e}"
             # 分析工作也放 bili_cache_dir
-            work = os.path.join(self.bili_cache_dir, f"analysis_{sess_id}")
+            work = os.path.join(self.bili_cache_dir, f"analysis_{sess_id}_{_wsuf}")
         else:
             # 非B站（QQ/本地）：存到 other_cache_dir
             os.makedirs(self.other_cache_dir, exist_ok=True)
             raw_path = surl
-            work = os.path.join(self.other_cache_dir, f"analysis_{sess_id}")
+            work = os.path.join(self.other_cache_dir, f"analysis_{sess_id}_{_wsuf}")
             if stype == "local":
                 raw_path = surl
 
@@ -1924,7 +2971,8 @@ class VideoComprehensionPlugin(BasePlugin):
             segments=[[s, e] for s, e in segments] if segments else None,
             skip_compress=bool(segments),
             skip_compress_if_under_mb=under_mb)
-        if result["status"] == "rejected": return f"⚠️ {result['error']}"
+        if result["status"] == "rejected":
+            return self._reject_hint(result)
         if result["status"] == "error": return f"⚠️ 处理失败：{result['error']}"
 
         sess = VideoSession(sess_id, sid, stype, surl) if sess_id not in self._sessions else self._sessions[sess_id]
@@ -1945,6 +2993,10 @@ class VideoComprehensionPlugin(BasePlugin):
                                        if stype == "bilibili" else 0,
                                        skip_asr=profile.native_audio)
         tdoc = tr.get("doc", "") or ""
+        # M5：指定时间段分析时，只带该段字幕（原先会把整片字幕塞进提示词，
+        #     既费 token 又容易让模型答非所问）
+        if real_segs:
+            tdoc = self._clip_transcript(tr, real_segs) or tdoc
         analysis, label, downgrade_note, host_url = await self._analyze_result(
             profile, result, real_segs, question, work, transcript_doc=tdoc,
             bili_bvid=bvid if stype == "bilibili" else "",
@@ -1968,14 +3020,27 @@ class VideoComprehensionPlugin(BasePlugin):
 
     @staticmethod
     def _direct_ttl_text(url: str) -> str:
-        """从 B 站直链里解析 deadline 签名，算出剩余有效期"""
-        m = re.search(r"[?&]deadline=(\d+)", url or "")
-        if not m:
-            return "带签名"
+        """从 B 站直链里解析签名，算出剩余有效期。
+
+        N2：B 站直链的签名参数不止 deadline（还有 w_rid / expired / ts 等变体），
+        原先只认 deadline，认不出就笼统说「带签名」，信息量太低。
+        这里多认几种常见形式；确实认不出就如实说明「无法判断剩余时间」。
+        """
+        u = url or ""
+        ts = None
+        m = re.search(r"[?&]deadline=(\d+)", u)          # 最常见
+        if m:
+            ts = m.group(1)
+        if ts is None:
+            m = re.search(r"[?&](?:expired|expires|expire|expire_at|ts)=(\d{9,})", u)
+            if m:
+                ts = m.group(1)
+        if ts is None:
+            return "⚠️ 带签名（无法判断剩余时间，建议现取现用）"
         try:
-            remain = int(m.group(1)) - int(time.time())
+            remain = int(ts) - int(time.time())
         except Exception:
-            return "带签名"
+            return "⚠️ 带签名（无法判断剩余时间，建议现取现用）"
         if remain <= 0:
             return "⚠️ 可能已失效"
         if remain >= 3600:
@@ -2192,16 +3257,21 @@ class VideoComprehensionPlugin(BasePlugin):
         if model_spec:
             sess.model_tag = profile.label or str(profile.group)
 
-        work = os.path.join(os.path.dirname(path), f"seg_{int(time.time()*1000) % 10**9}")
+        # N5 + M4：work 目录带随机后缀，且同一会话的「同一视频」分析串行化，
+        #          避免两个并发时间段分析写同一个目录互相踩。
+        work = os.path.join(os.path.dirname(path),
+                            f"seg_{int(time.time()*1000) % 10**9}_{uuid.uuid4().hex[:6]}")
         os.makedirs(work, exist_ok=True)
-        result = await process_video(path, work_dir=work,
-            max_file_mb=max(self.max_file_mb, 4096),
-            max_duration_sec=max(self.max_duration, int(sess.duration) + 1),
-            download_timeout=self.dl_timeout,
-            target_frames=self.target_frames, scene_threshold=self.scene_threshold,
-            max_per_grid=self.max_per_grid, grid_cols=self.grid_cols,
-            cell_width=self.cell_width, cell_ratio=self.cell_ratio,
-            segments=[[s, e] for s, e in real], skip_compress=True)
+        async with self._session_lock(f"{sess.session_id}:segment"):
+            result = await process_video(
+                path, work_dir=work,
+                max_file_mb=max(self.max_file_mb, 4096),
+                max_duration_sec=max(self.max_duration, int(sess.duration) + 1),
+                download_timeout=self.dl_timeout,
+                target_frames=self.target_frames, scene_threshold=self.scene_threshold,
+                max_per_grid=self.max_per_grid, grid_cols=self.grid_cols,
+                cell_width=self.cell_width, cell_ratio=self.cell_ratio,
+                segments=[[s, e] for s, e in real], skip_compress=True)
         if result["status"] != "ok":
             return f"⚠️ 处理失败：{result.get('error', result['status'])}"
 
@@ -2222,19 +3292,10 @@ class VideoComprehensionPlugin(BasePlugin):
                 f"🤖 {label}\n{link_line}━━━\n{analysis}{note}\n━━━\n"
                 f"💡 继续追问用 session_id=\"{sess.session_id}\"")
 
-    async def _deep(self, sess):
-        bvid = BVID_RE.search(sess.source_url)
-        return await self._vision(sess.session_id, sess.sid, "bilibili", sess.source_url,
-                                   bvid.group(0) if bvid else "",
-                                   "对B站AI总结做补充，深入分析画面")
-
     async def _followup(self, sess, question, model_spec=None):
         if not question:
             return (f"当前 session={sess.session_id}\n{self._link_line(sess.host_url)}"
                     f"{sess.analysis[:300]}\n追问用 session_id=\"{sess.session_id}\"")
-        if not sess.grids_base64:
-            return (f"只有{sess.analysis_mode}结果，深度分析后可追问画面。\n"
-                    f"{self._link_line(sess.host_url)}已有: {sess.analysis[:200]}")
         # 模型粘性：追问没指定 model 时，沿用该会话首次分析用的那一组，
         # 而不是退回默认优先级（否则「同一个视频前后换了模型」）
         spec = model_spec or sess.model_tag
@@ -2244,6 +3305,28 @@ class VideoComprehensionPlugin(BasePlugin):
         if not profile: return "无可用模型"
         if model_spec:                                   # 本次显式换了模型 → 更新会话
             sess.model_tag = profile.label or str(profile.group)
+
+        # M3：拼图被 LRU 回收后仍可追问 —— 退化为「基于已有分析文本 + 转写」作答，
+        #     而不是直接拒绝（原先会回「只有xx结果，深度分析后可追问画面」）。
+        if not sess.grids_base64:
+            if not (sess.analysis or sess.transcript_doc):
+                return ("⚠️ 该会话的可用资料已过期（拼图与分析都被清理），"
+                        "请重新发送视频或重新分析")
+            meta = f"【视频文字资料】已有分析结论与语音转写（画面帧已回收，无法再看画面）\n" \
+                   f"时长: {sess.duration:.1f}s"
+            ctx = (f"之前: {sess.analysis[:1500]}\n\n"
+                   f"{sess.transcript_doc[:3000]}\n\n追问: {question}\n\n"
+                   f"基于以上文字资料回答；如果问题必须看画面才能答，"
+                   f"请明确说明「需要重新分析该视频才能回答」，不要编造画面内容。")
+            try:
+                ans = await analyze_frames(profile, [], meta, ctx, "")
+            except Exception as e:
+                ans = f"⚠️ 追问失败: {type(e).__name__}: {e}"
+            sess.add_turn(question, ans)
+            return (f"🤖 {profile.name} | session={sess.session_id}\n"
+                    f"（提示：该会话的画面帧已被回收，本次基于文字资料作答）\n"
+                    f"━━━\n{ans}")
+
         meta = build_meta(sess.duration, sess.total_frames, len(sess.grids_base64),
                           sess.scene_count, sess.timestamps)
         ctx = f"之前: {sess.analysis[:500]}\n\n追问: {question}\n\n基于帧回答指出时间。"
