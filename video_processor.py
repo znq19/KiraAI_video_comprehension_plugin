@@ -13,18 +13,19 @@ from __future__ import annotations
 
 import asyncio
 import base64
-import hashlib
 import json
 import math
 import os
 import re
+import shutil
 import subprocess
 import tempfile
 import time
-import urllib.request
 from io import BytesIO
-from pathlib import Path
-from typing import Optional
+
+import httpx
+
+from process_utils import run_subprocess
 
 # 下载视频时带的 UA（部分 CDN 会对默认 UA 返回 403）
 UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
@@ -32,7 +33,6 @@ UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
 
 try:
     from PIL import Image, ImageDraw, ImageFont
-    from PIL import __version__ as _pil_version
 except ImportError:
     Image = None
     ImageDraw = None
@@ -63,10 +63,13 @@ def _load_font(size: int = 14):
 # ── 工具函数 ───────────────────────────────────────────────
 
 def _ensure_ffmpeg() -> bool:
-    """检查 ffmpeg 是否可用"""
+    """ffmpeg 与 ffprobe 必须同时可用（同步实现，调用方负责移出事件循环）。"""
     try:
-        r = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
-        return r.returncode == 0
+        r1 = subprocess.run(["ffmpeg", "-version"], capture_output=True, timeout=5)
+        if r1.returncode != 0:
+            return False
+        r2 = subprocess.run(["ffprobe", "-version"], capture_output=True, timeout=5)
+        return r2.returncode == 0
     except Exception:
         return False
 
@@ -78,23 +81,17 @@ def _format_ts(seconds: float) -> str:
     return f"{m:02d}:{s:06.3f}"
 
 
-def _get_video_info(video_path: str) -> dict:
-    """用 ffprobe 读取视频基本信息（同步；调用方应经 to_thread 使用）"""
-    cmd = [
-        "ffprobe", "-v", "quiet", "-print_format", "json",
-        "-show_format", "-show_streams",
-        video_path,
-    ]
-    try:
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-    except Exception:
-        return {"duration": 0, "width": 0, "height": 0, "size": 0}
+def _empty_video_info() -> dict:
+    return {"duration": 0, "width": 0, "height": 0, "size": 0}
+
+
+def _video_info_from_result(r) -> dict:
     if r.returncode != 0:
-        return {"duration": 0, "width": 0, "height": 0, "size": 0}
+        return _empty_video_info()
     try:
         info = json.loads(r.stdout)
     except Exception:
-        return {"duration": 0, "width": 0, "height": 0, "size": 0}
+        return _empty_video_info()
     duration = 0
     width, height = 0, 0
     for s in info.get("streams", []):
@@ -107,9 +104,26 @@ def _get_video_info(video_path: str) -> dict:
     return {"duration": duration, "width": width, "height": height, "size": file_size}
 
 
+def _get_video_info(video_path: str) -> dict:
+    """兼容旧同步调用；生产异步链路使用 get_video_info_async。"""
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_format", "-show_streams", video_path]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    except Exception:
+        return _empty_video_info()
+    return _video_info_from_result(r)
+
+
 async def get_video_info_async(video_path: str) -> dict:
-    """ffprobe 探测（在线程池里跑，避免阻塞事件循环）"""
-    return await asyncio.to_thread(_get_video_info, video_path)
+    """可取消的 ffprobe 探测；超时返回空信息，取消则终止进程并上抛。"""
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json",
+           "-show_format", "-show_streams", video_path]
+    try:
+        r = await run_subprocess(cmd, timeout=30)
+    except Exception:
+        return _empty_video_info()
+    return _video_info_from_result(r)
 
 
 # ── 视频下载 ───────────────────────────────────────────────
@@ -120,49 +134,49 @@ class DownloadTooLarge(Exception):
 
 async def download_video(url: str, dest: str, timeout: int = 120,
                          max_bytes: int = 0, headers: dict | None = None) -> str:
-    """异步下载视频文件，返回本地路径。
+    """流式下载到 .part，完成后原子替换；超时/取消会关闭真实 HTTP 流。"""
+    tmp = dest + ".part"
 
-    max_bytes > 0 时边下边校验，超过即中止并抛 DownloadTooLarge
-    （避免群里有人丢个几 GB 的文件把磁盘写满）。
-    """
-    loop = asyncio.get_event_loop()
-
-    def _dl():
-        req = urllib.request.Request(url, headers=headers or {"User-Agent": UA})
-        try:
-            resp = urllib.request.urlopen(req, timeout=timeout)
-        except Exception:
-            # 带 UA 被拒时退回默认请求头再试一次
-            resp = urllib.request.urlopen(urllib.request.Request(url), timeout=timeout)
-        with resp:
-            if max_bytes > 0:
-                cl = resp.headers.get("Content-Length")
-                try:
-                    if cl and int(cl) > max_bytes:
-                        raise DownloadTooLarge(
-                            f"文件 {int(cl) / 1048576:.1f}MB 超过上限 {max_bytes / 1048576:.0f}MB")
-                except ValueError:
-                    pass
-            total = 0
-            with open(dest, "wb") as f:
-                while True:
-                    chunk = resp.read(65536)
-                    if not chunk:
-                        break
-                    total += len(chunk)
-                    if max_bytes > 0 and total > max_bytes:
-                        raise DownloadTooLarge(
-                            f"下载已超过上限 {max_bytes / 1048576:.0f}MB，已中止")
-                    f.write(chunk)
+    async def _attempt(request_headers):
+        async with httpx.AsyncClient(follow_redirects=True, timeout=timeout,
+                                     trust_env=True) as client:
+            async with client.stream("GET", url, headers=request_headers) as resp:
+                resp.raise_for_status()
+                if max_bytes > 0:
+                    cl = resp.headers.get("Content-Length")
+                    try:
+                        if cl and int(cl) > max_bytes:
+                            raise DownloadTooLarge(
+                                f"文件 {int(cl) / 1048576:.1f}MB 超过上限 {max_bytes / 1048576:.0f}MB")
+                    except ValueError:
+                        pass
+                total = 0
+                with open(tmp, "wb") as f:
+                    async for chunk in resp.aiter_bytes(65536):
+                        total += len(chunk)
+                        if max_bytes > 0 and total > max_bytes:
+                            raise DownloadTooLarge(
+                                f"下载已超过上限 {max_bytes / 1048576:.0f}MB，已中止")
+                        await asyncio.to_thread(f.write, chunk)
+        await asyncio.to_thread(os.replace, tmp, dest)
         return dest
 
-    try:
-        return await asyncio.wait_for(loop.run_in_executor(None, _dl), timeout=timeout)
-    except DownloadTooLarge:
+    async def _with_fallback():
         try:
-            if os.path.exists(dest):
-                os.remove(dest)
-        except Exception:
+            return await _attempt(dict(headers or {"User-Agent": UA}))
+        except DownloadTooLarge:
+            raise
+        except httpx.HTTPError:
+            # 与旧实现一致：带 UA 失败时再用默认请求头尝试一次。
+            return await _attempt({})
+
+    try:
+        return await asyncio.wait_for(_with_fallback(), timeout=timeout)
+    except BaseException:
+        # 只清临时文件；dest 若已有完整旧缓存，绝不能被失败下载误删。
+        try:
+            os.remove(tmp)
+        except OSError:
             pass
         raise
 
@@ -180,6 +194,7 @@ async def compress_video(
 
     保持原时长不变，仅减小体积。
     """
+    tmp = output_path + ".part.mp4"
     cmd = [
         "ffmpeg", "-y", "-i", input_path,
         "-vf", f"scale='min({max_width},iw)':-2",
@@ -188,59 +203,68 @@ async def compress_video(
         "-crf", str(crf),
         "-c:a", "aac", "-b:a", audio_bitrate,
         "-movflags", "+faststart",
-        output_path,
+        tmp,
     ]
 
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    try:
+        r = await run_subprocess(cmd, timeout=300)
         if r.returncode != 0:
             raise RuntimeError(f"压缩失败: {r.stderr[:500]}")
+        await asyncio.to_thread(os.replace, tmp, output_path)
         return output_path
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── 三级抽帧 ───────────────────────────────────────────────
 
-def _scan_all_frames(video_path: str) -> list:
-    """ffprobe 扫描所有帧 → [(timestamp, frame_type, 0.0), ...]
+def _parse_frames_csv(text: str) -> list:
+    frames = []
+    for line in text.strip().split("\n"):
+        line = line.strip()
+        if not line or "," not in line:
+            continue
+        parts = line.split(",")
+        try:
+            ts = float(parts[0])
+        except (ValueError, IndexError):
+            continue
+        ft = parts[1].strip().upper() if len(parts) >= 2 and parts[1].strip() else "P"
+        frames.append((ts, ft, 0.0))
+    return frames
 
-    ⚠️ ffmpeg 5+ 已移除 pkt_pts_time：用它会得到空列（如 "I,"），
-    导致每一帧解析失败、抽帧整体失效。这里按
-    best_effort_timestamp_time → pts_time → pkt_pts_time 依次回退。
-    """
-    entries_candidates = (
-        "best_effort_timestamp_time,pict_type",
-        "pts_time,pict_type",
-        "pkt_pts_time,pict_type",
-    )
-    for entries in entries_candidates:
-        cmd = [
-            "ffprobe", "-v", "quiet",
-            "-select_streams", "v:0",
-            "-show_entries", f"frame={entries}",
-            "-of", "csv=p=0",
-            video_path,
-        ]
+
+def _scan_all_frames_sync(video_path: str) -> list:
+    """兼容旧同步调用；生产链路使用下方可取消异步版本。"""
+    for entries in ("best_effort_timestamp_time,pict_type", "pts_time,pict_type",
+                    "pkt_pts_time,pict_type"):
+        cmd = ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+               "-show_entries", f"frame={entries}", "-of", "csv=p=0", video_path]
         try:
             r = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
         except Exception:
             continue
-        if r.returncode != 0:
+        frames = _parse_frames_csv(r.stdout) if r.returncode == 0 else []
+        if frames:
+            return frames
+    return []
+
+
+async def _scan_all_frames(video_path: str) -> list:
+    """可取消的全帧扫描，时间戳回退顺序与旧实现一致。"""
+    for entries in ("best_effort_timestamp_time,pict_type", "pts_time,pict_type",
+                    "pkt_pts_time,pict_type"):
+        cmd = ["ffprobe", "-v", "quiet", "-select_streams", "v:0",
+               "-show_entries", f"frame={entries}", "-of", "csv=p=0", video_path]
+        try:
+            r = await run_subprocess(cmd, timeout=120)
+        except Exception:
             continue
-        frames = []
-        for line in r.stdout.strip().split("\n"):
-            line = line.strip()
-            if not line or "," not in line:
-                continue
-            parts = line.split(",")
-            try:
-                ts = float(parts[0])
-            except (ValueError, IndexError):
-                continue
-            ft = parts[1].strip().upper() if len(parts) >= 2 and parts[1].strip() else "P"
-            frames.append((ts, ft, 0.0))
+        frames = _parse_frames_csv(r.stdout) if r.returncode == 0 else []
         if frames:
             return frames
     return []
@@ -269,65 +293,53 @@ def _calc_scene_scores(frames, span: float, scene_threshold: float):
     return scored
 
 
-def _extract_range(video_path: str, out_dir: str, all_frames: list,
-                   seg_start: float, seg_end: float, n_frames: int,
-                   scene_threshold: float, seg_idx: int = 0) -> list:
-    """在 [seg_start, seg_end] 内做三级抽帧；时间戳保留原时间轴（绝对秒）。
-
-    三级策略：场景变化帧 → I 帧补充 → 区间内均匀补帧。
-    """
-    seg_frames = [f for f in all_frames if seg_start <= f[0] <= seg_end]
+async def _extract_range(video_path: str, out_dir: str, all_frames: list,
+                         seg_start: float, seg_end: float, n_frames: int,
+                         scene_threshold: float, seg_idx: int = 0) -> list:
+    """在指定区间三级抽帧；每个 ffmpeg 都能在取消/超时时被真正终止。"""
+    seg_frames = await asyncio.to_thread(
+        lambda: [f for f in all_frames if seg_start <= f[0] <= seg_end])
     if not seg_frames:
-        # 区间内扫不到帧（段极短/扫描异常）→ 用区间首尾兜底
         seg_frames = [(seg_start, "P", 0.0), (seg_end, "P", 0.0)]
     seg_span = max(seg_end - seg_start, 0.001)
-    scored_frames = _calc_scene_scores(seg_frames, seg_span, scene_threshold)
+    scored_frames = await asyncio.to_thread(
+        _calc_scene_scores, seg_frames, seg_span, scene_threshold)
 
     selected = set()
     result = []
     prefix = f"s{seg_idx}"
-    # 去重阈值随段长/目标帧数自适应（短段用更小间隔，否则帧被过滤得太少）
     min_gap = max(0.05, min(0.3, seg_span / max(n_frames * 2, 1)))
 
-    def _extract_one(ts: float, ft: str, label: str, idx: int):
+    async def _extract_one(ts: float, ft: str, label: str, idx: int):
         fname = f"{prefix}_{label}_{idx:04d}.jpg"
         fpath = os.path.join(out_dir, fname)
-        cmd = [
-            "ffmpeg", "-y",
-            "-ss", str(ts),
-            "-i", video_path,
-            "-vframes", "1",
-            "-qscale:v", "3",
-            "-an",
-            fpath,
-        ]
-        subprocess.run(cmd, capture_output=True, timeout=60)
-        if not os.path.exists(fpath):
+        cmd = ["ffmpeg", "-y", "-ss", str(ts), "-i", video_path,
+               "-vframes", "1", "-qscale:v", "3", "-an", fpath]
+        r = await run_subprocess(cmd, timeout=60)
+        if r.returncode != 0 or not os.path.isfile(fpath) or os.path.getsize(fpath) == 0:
             return None
         return {"path": fpath, "timestamp": ts, "frame_type": ft,
                 "frame_idx": idx, "segment": seg_idx}
 
-    def _safe_extract(ts: float, ft: str, label: str, idx: int):
+    async def _safe_extract(ts: float, ft: str, label: str, idx: int):
         for e in selected:
             if abs(e - ts) < min_gap:
                 return None
-        got = _extract_one(ts, ft, label, idx)
+        got = await _extract_one(ts, ft, label, idx)
         if got:
             selected.add(round(ts, 2))
         return got
 
-    # 第一级：场景变换帧（最多 1/3 目标帧数）
     scene_ts_list = [(ts, ft) for ts, ft, sc in scored_frames if sc > 0.001]
     max_scene = max(1, n_frames // 3)
     picked = 0
     for ts, ft in scene_ts_list[:max_scene]:
-        r = _safe_extract(ts, ft, "sc", picked)
+        r = await _safe_extract(ts, ft, "sc", picked)
         if r:
             r["_source"] = "scene"
             result.append(r)
             picked += 1
 
-    # 第二级：I 帧补充
     i_frame_ts = [ts for i, (ts, ft, sc) in enumerate(scored_frames)
                   if ft == "I" and i % 12 == 0]
     need = n_frames // 2 - len(result)
@@ -335,29 +347,33 @@ def _extract_range(video_path: str, out_dir: str, all_frames: list,
     for j in range(0, len(i_frame_ts), step):
         if len(result) >= n_frames * 2 // 3:
             break
-        r = _safe_extract(i_frame_ts[j], "I", "i", len(result))
+        r = await _safe_extract(i_frame_ts[j], "I", "i", len(result))
         if r:
             r["_source"] = "ifr"
             result.append(r)
 
-    # 第三级：区间内均匀补帧
     need_uniform = n_frames - len(result)
     if need_uniform > 0:
         interval = seg_span / (need_uniform + 1)
-        for k in range(1, need_uniform + 1):
-            ts = seg_start + k * interval
+
+        def _nearest(ts):
+            # 保留旧算法的边界初值，确保异步重构前后选帧逐帧一致。
             best_ts, best_gap = ts, 999.0
-            for fts, fft, _ in scored_frames:
+            for fts, _fft, _ in scored_frames:
                 gap = abs(fts - ts)
                 if gap < best_gap:
                     best_gap, best_ts = gap, fts
-            r = _safe_extract(best_ts, "P", "u", len(result))
+            return best_ts
+
+        for k in range(1, need_uniform + 1):
+            ts = seg_start + k * interval
+            best_ts = await asyncio.to_thread(_nearest, ts)
+            r = await _safe_extract(best_ts, "P", "u", len(result))
             if r:
                 r["_source"] = "uniform"
                 result.append(r)
 
     result.sort(key=lambda x: x["timestamp"])
-    # 超出 n_frames 时优先丢弃均匀补帧
     while len(result) > n_frames:
         discard_idx = None
         for i in range(1, len(result) - 1):
@@ -402,53 +418,64 @@ async def extract_frames(
     target_frames: int = 40,
     scene_threshold: float = 0.3,
     segments=None,
+    out_dir: str | None = None,
 ) -> list:
     """三级抽帧策略，返回 [{path, timestamp, frame_type, frame_idx, segment}, ...]
 
     segments: None/[] = 全片；[[start_sec, end_sec], ...] = 只抽这些区间。
-              每段帧数按段长自适应（见 segment_frame_budget）。
-
-    关键改进：先用 ffprobe 算出所有帧的精确时间戳，再逐个用 -ss 精确提取，
-    避免 select filter 的帧索引漂移问题；时间戳始终为视频绝对时间。
+    out_dir 由流水线传入时，调用方负责 finally 清理；默认自建目录则兼容
+    旧的独立调用方式，并在失败、早退或没有有效帧路径时自行清理。
     """
-    out_dir = tempfile.mkdtemp(prefix="vcf_")
-    info = await asyncio.to_thread(_get_video_info, video_path)
-    duration = info.get("duration", 0)
-    if duration <= 0:
-        def _probe_duration():
-            cmd = ["ffmpeg", "-i", video_path, "-f", "null", "-"]
-            try:
-                r = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
-            except Exception:
-                return 0.0
-            m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", r.stderr or "")
-            if not m:
-                return 0.0
-            return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
-        duration = await asyncio.to_thread(_probe_duration)
-    if duration <= 0:
-        return []
+    owns_out_dir = out_dir is None
+    if owns_out_dir:
+        out_dir = tempfile.mkdtemp(prefix="vcf_")
+    else:
+        os.makedirs(out_dir, exist_ok=True)
+    keep_for_caller = False
+    try:
+        info = await get_video_info_async(video_path)
+        duration = info.get("duration", 0)
+        if duration <= 0:
+            async def _probe_duration():
+                cmd = ["ffmpeg", "-i", video_path, "-f", "null", "-"]
+                try:
+                    r = await run_subprocess(cmd, timeout=60)
+                except Exception:
+                    return 0.0
+                m = re.search(r"Duration: (\d+):(\d+):(\d+\.\d+)", r.stderr or "")
+                if not m:
+                    return 0.0
+                return int(m.group(1)) * 3600 + int(m.group(2)) * 60 + float(m.group(3))
+            duration = await _probe_duration()
+        if duration <= 0:
+            return []
 
-    loop = asyncio.get_event_loop()
-    all_frames = await loop.run_in_executor(None, _scan_all_frames, video_path)
-    if not all_frames:
-        return [
-            {"path": "", "timestamp": 0, "frame_type": "I", "frame_idx": 0, "segment": 0},
-            {"path": "", "timestamp": duration, "frame_type": "P", "frame_idx": 1, "segment": 0},
-        ]
+        all_frames = await _scan_all_frames(video_path)
+        if not all_frames:
+            # 不再制造空路径灰色假帧。ffprobe 扫描失败时，按真实时长生成
+            # 均匀时间点，让 ffmpeg 实际抽帧；失败则由上层明确报错。
+            fallback_segs = normalize_segments(segments, duration)
+            n_fallback = len(fallback_segs)
+            for s, e in fallback_segs:
+                count = max(2, segment_frame_budget(e - s, n_fallback, target_frames))
+                for i in range(count):
+                    ts = s + (e - s) * i / (count - 1)
+                    all_frames.append((ts, "P", 0.0))
 
-    segs = normalize_segments(segments, duration)
-    n_seg = len(segs)
-    result = []
-    for si, (s, e) in enumerate(segs):
-        n = segment_frame_budget(e - s, n_seg, target_frames)
-        # ⚠️ _extract_range 内部是逐帧 subprocess.run（最多几十次），**必须**
-        #    丢到线程池 —— 否则会阻塞事件循环，拖住全局计时器（含框架的工具超时）
-        part = await asyncio.to_thread(
-            _extract_range, video_path, out_dir, all_frames, s, e, n,
-            scene_threshold, si)
-        result.extend(part)
-    return result
+        segs = normalize_segments(segments, duration)
+        n_seg = len(segs)
+        result = []
+        for si, (s, e) in enumerate(segs):
+            n = segment_frame_budget(e - s, n_seg, target_frames)
+            part = await _extract_range(
+                video_path, out_dir, all_frames, s, e, n, scene_threshold, si)
+            result.extend(part)
+        # 独立调用仍保留旧契约：有效 JPEG 交给调用方使用，不能提前删除。
+        keep_for_caller = owns_out_dir and any(f.get("path") for f in result)
+        return result
+    finally:
+        if owns_out_dir and not keep_for_caller:
+            await asyncio.to_thread(shutil.rmtree, out_dir, ignore_errors=True)
 
 
 async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
@@ -459,6 +486,7 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
     """
     start = max(0.0, float(start))
     req_dur = max(0.1, float(end) - start)
+    tmp = dst + ".part.mp4"
     cmd = [
         "ffmpeg", "-y",
         "-ss", str(start),
@@ -467,22 +495,24 @@ async def clip_video(src: str, dst: str, start: float, end: float) -> tuple:
         "-c", "copy",
         "-avoid_negative_ts", "make_zero",
         "-movflags", "+faststart",
-        dst,
+        tmp,
     ]
 
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
-        if r.returncode != 0 or not os.path.exists(dst) or os.path.getsize(dst) == 0:
+    try:
+        r = await run_subprocess(cmd, timeout=180)
+        if r.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) == 0:
             raise RuntimeError(f"裁剪失败: {(r.stderr or '')[:300]}")
-        # ⚠️ 这里本来就在线程池里，可以直接用同步版探测（不要再套 to_thread）
-        info = _get_video_info(dst)
+        info = await get_video_info_async(tmp)
         real_dur = float(info.get("duration") or req_dur)
-        # 秒切会从最近的关键帧开始 → 实际时长 > 请求时长，差值即起点提前量
         actual_start = max(0.0, start - max(0.0, real_dur - req_dur))
+        await asyncio.to_thread(os.replace, tmp, dst)
         return dst, real_dur, actual_start
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run)
+    except BaseException:
+        try:
+            os.remove(tmp)
+        except OSError:
+            pass
+        raise
 
 
 # ── 音频处理（语音转写用） ─────────────────────────────────
@@ -502,14 +532,10 @@ async def extract_audio(video_path: str, out_path: str, sample_rate: int = 16000
         out_path,
     ]
 
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError(f"抽音轨失败: {(r.stderr or '')[:300]}")
-        return out_path
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run)
+    r = await run_subprocess(cmd, timeout=timeout)
+    if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"抽音轨失败: {(r.stderr or '')[:300]}")
+    return out_path
 
 
 async def detect_speech_ranges(audio_path: str, noise_db: float = -35.0,
@@ -527,12 +553,8 @@ async def detect_speech_ranges(audio_path: str, noise_db: float = -35.0,
         "-f", "null", "-",
     ]
 
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        return r.stderr or ""
-
-    loop = asyncio.get_event_loop()
-    err = await loop.run_in_executor(None, _run)
+    r = await run_subprocess(cmd, timeout=timeout)
+    err = r.stderr or ""
 
     silences = []
     cur_start = None
@@ -619,14 +641,10 @@ async def slice_audio(audio_path: str, out_path: str, start: float, end: float,
         out_path,
     ]
 
-    def _run():
-        r = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
-        if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
-            raise RuntimeError(f"音频切块失败: {(r.stderr or '')[:200]}")
-        return out_path
-
-    loop = asyncio.get_event_loop()
-    return await loop.run_in_executor(None, _run)
+    r = await run_subprocess(cmd, timeout=timeout)
+    if r.returncode != 0 or not os.path.exists(out_path) or os.path.getsize(out_path) == 0:
+        raise RuntimeError(f"音频切块失败: {(r.stderr or '')[:200]}")
+    return out_path
 
 
 # ── 时间戳标注 ─────────────────────────────────────────────
@@ -846,8 +864,8 @@ async def process_video(
             "timestamps": list[float],  # 所有帧的时间戳
         }
     """
-    if not _ensure_ffmpeg():
-        return {"status": "error", "error": "ffmpeg 不可用，请安装 ffmpeg"}
+    if not await asyncio.to_thread(_ensure_ffmpeg):
+        return {"status": "error", "error": "ffmpeg/ffprobe 不可用，请安装后重试"}
 
     if work_dir is None:
         work_dir = tempfile.mkdtemp(prefix="vc_")
@@ -883,7 +901,7 @@ async def process_video(
             }
 
         # 3. 获取基本信息
-        info = await asyncio.to_thread(_get_video_info, raw_path)
+        info = await get_video_info_async(raw_path)
         duration = info.get("duration", 0)
         width = info.get("width", 0)
         height = info.get("height", 0)
@@ -909,7 +927,7 @@ async def process_video(
                 await compress_video(raw_path, compressed_path,
                                      max_width=compress_max_width,
                                      crf=compress_crf)
-            except Exception as e:
+            except Exception:
                 # 压缩失败，改用原文件
                 compressed_path = raw_path
         else:
@@ -918,63 +936,68 @@ async def process_video(
         compressed_size_mb = os.path.getsize(compressed_path) / (1024 * 1024)
         compress_ratio = compressed_size_mb / file_size_mb if file_size_mb > 0 else 1
 
-        # 5. 抽帧（可指定区间）
-        frames = await extract_frames(
-            compressed_path if os.path.exists(compressed_path) else raw_path,
-            target_frames=target_frames,
-            scene_threshold=scene_threshold,
-            segments=segments,
-        )
+        # 5. 抽帧（可指定区间）。JPEG 只用于本轮拼图，转 base64 后必须删除。
+        frames_dir = tempfile.mkdtemp(prefix="vcf_")
+        try:
+            frames = await extract_frames(
+                compressed_path if os.path.exists(compressed_path) else raw_path,
+                target_frames=target_frames,
+                scene_threshold=scene_threshold,
+                segments=segments,
+                out_dir=frames_dir,
+            )
 
-        # 统计真实场景变化帧数（此前误用 I 帧数量）
-        scene_count = sum(1 for f in frames if f.get("source") == "scene")
+            # 统计真实场景变化帧数（此前误用 I 帧数量）
+            scene_count = sum(1 for f in frames if f.get("source") == "scene")
 
-        # 6. 拼图：按段分别拼（段数 > 1 时在底部标注段号与区间）
-        segs = normalize_segments(segments, duration)
-        multi = len(segs) > 1
-        grids = []
-        for si, (seg_s, seg_e) in enumerate(segs):
-            seg_frames = [f for f in frames if f.get("segment", 0) == si]
-            if not seg_frames:
-                continue
-            label = (f"段{si + 1}/{len(segs)} {_format_ts(seg_s)}~{_format_ts(seg_e)} | "
-                     if multi else "")
-            grids.extend(await composite_grid(
-                seg_frames,
-                cols=grid_cols,
-                max_per_grid=max_per_grid,
-                cell_width=cell_width,
-                cell_ratio=cell_ratio,
-                duration=duration,
-                video_width=width,
-                video_height=height,
-                scene_count=scene_count,
-                seg_label=label,
-            ))
+            # 6. 拼图：按段分别拼（段数 > 1 时在底部标注段号与区间）
+            segs = normalize_segments(segments, duration)
+            multi = len(segs) > 1
+            grids = []
+            for si, (seg_s, seg_e) in enumerate(segs):
+                seg_frames = [f for f in frames if f.get("segment", 0) == si]
+                if not seg_frames:
+                    continue
+                label = (f"段{si + 1}/{len(segs)} {_format_ts(seg_s)}~{_format_ts(seg_e)} | "
+                         if multi else "")
+                grids.extend(await composite_grid(
+                    seg_frames,
+                    cols=grid_cols,
+                    max_per_grid=max_per_grid,
+                    cell_width=cell_width,
+                    cell_ratio=cell_ratio,
+                    duration=duration,
+                    video_width=width,
+                    video_height=height,
+                    scene_count=scene_count,
+                    seg_label=label,
+                ))
 
-        # 7. 转 base64（JPEG 编码是 CPU 重活，丢线程池，别卡住事件循环）
-        grids_b64 = await asyncio.to_thread(
-            lambda: [grid_to_base64(g) for g in grids])
+            # 7. 转 base64（JPEG 编码是 CPU 重活，丢线程池，别卡住事件循环）
+            grids_b64 = await asyncio.to_thread(
+                lambda: [grid_to_base64(g) for g in grids])
 
-        elapsed = time.time() - start
+            elapsed = time.time() - start
 
-        return {
-            "status": "ok",
-            "duration": duration,
-            "width": width,
-            "height": height,
-            "file_size_mb": file_size_mb,
-            "compressed_path": compressed_path,
-            "compressed_size_mb": compressed_size_mb,
-            "compress_ratio": compress_ratio,
-            "grids_base64": grids_b64,
-            "grid_count": len(grids),
-            "scene_count": scene_count,
-            "total_frames": len(frames),
-            "timestamps": [f["timestamp"] for f in frames],
-            "segments": [[s, e] for s, e in segs],
-            "elapsed_sec": elapsed,
-        }
+            return {
+                "status": "ok",
+                "duration": duration,
+                "width": width,
+                "height": height,
+                "file_size_mb": file_size_mb,
+                "compressed_path": compressed_path,
+                "compressed_size_mb": compressed_size_mb,
+                "compress_ratio": compress_ratio,
+                "grids_base64": grids_b64,
+                "grid_count": len(grids),
+                "scene_count": scene_count,
+                "total_frames": len(frames),
+                "timestamps": [f["timestamp"] for f in frames],
+                "segments": [[s, e] for s, e in segs],
+                "elapsed_sec": elapsed,
+            }
+        finally:
+            await asyncio.to_thread(shutil.rmtree, frames_dir, ignore_errors=True)
 
     except asyncio.TimeoutError:
         return {"status": "error", "error": f"视频下载超时 ({download_timeout}s)"}

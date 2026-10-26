@@ -1,4 +1,4 @@
-"""视频理解插件 v1.17.0 自检（离线，不依赖 KiraAI 本体）
+"""视频理解插件 v1.18.0 自检（离线，不依赖 KiraAI 本体）
 
 跑法：
     cd <插件目录>
@@ -100,11 +100,13 @@ def static_checks():
     vp_tree = ast.parse(read("video_processor.py"))
     vp_awaits = [ast.unparse(n) for n in ast.walk(vp_tree) if isinstance(n, ast.Await)]
     joined = "\n".join(vp_awaits)
-    check("L2 抽帧区间在线程池 (to_thread)",
-          "to_thread(_extract_range" in joined or "_extract_range" in joined)
+    check("L2 抽帧区间为可取消异步进程",
+          "async def _extract_range" in vp_code and "await _extract_range" in joined
+          and "run_subprocess" in vp_code)
     check("L2 拼图在线程池", "_composite_grid_sync" in joined)
-    check("L2 ffprobe 探测在线程池",
-          "to_thread(_get_video_info" in joined and "to_thread" in joined)
+    check("L2 ffprobe 为可取消异步进程",
+          "async def get_video_info_async" in vp_code
+          and "await get_video_info_async" in joined and "run_subprocess" in vp_code)
     check("L2 base64 编码在线程池",
           "to_thread" in joined and "grid_to_base64" in joined)
     check("L2 拼图有同步实现体", "_composite_grid_sync" in vp_code)
@@ -212,7 +214,8 @@ def static_checks():
     check("审计：_submit_or_run 参数不残留到 **kw（防 TypeError）",
           "for _k in (\"segs\", \"segments\", \"question\"" in main_code)
     check("审计：抽帧区间调用参数与签名一致（避免 TypeError）",
-          "await asyncio.to_thread(\n            _extract_range, video_path, out_dir, all_frames, s, e, n,\n            scene_threshold, si)" in read("video_processor.py"))
+          re.search(r"await _extract_range\(\s*video_path,\s*out_dir,\s*all_frames,\s*s,\s*e,\s*n,\s*scene_threshold,\s*si\)",
+                    read("video_processor.py")) is not None)
     check("审计：任务/通告/锁 三张表都有清理（无泄漏）",
           "_prune_tasks" in main_code and "flushing.discard(sid)" in main_code
           and "self._locks.pop(k, None)" in main_code)
@@ -294,6 +297,15 @@ def build_plugin(tmpdir, cfg=None):
     provider = types.ModuleType("core.provider")
     provider.LLMRequest = type("LLMRequest", (), {})
 
+    prompt_manager = types.ModuleType("core.prompt_manager")
+    class _Prompt:
+        def __init__(self, content="", name=None, source=None, end="\n", persist=True, **kwargs):
+            self.content, self.name, self.source = content, name, source
+            self.end, self.persist = end, persist
+        def to_string(self):
+            return (self.content or "") + (self.end or "")
+    prompt_manager.Prompt = _Prompt
+
     utils = types.ModuleType("core.utils")
     path_utils = types.ModuleType("core.utils.path_utils")
     path_utils.get_data_path = lambda: __import__("pathlib").Path(tmpdir)
@@ -303,6 +315,7 @@ def build_plugin(tmpdir, cfg=None):
         "core.chat.message_utils": chat.message_utils,
         "core.chat.message_elements": chat.message_elements,
         "core.provider": provider, "core.utils": utils,
+        "core.prompt_manager": prompt_manager,
         "core.utils.path_utils": path_utils,
     })
     for m in ("core.chat", ):
@@ -332,13 +345,15 @@ def build_plugin(tmpdir, cfg=None):
     #    （清理防御性 getattr 后，少一个字段就会 AttributeError）
     for attr, val in [("_pending", {}), ("_sessions", {}), ("_sid_sessions", {}),
                       ("_locks", {}), ("_cleanup", None), ("_auto_sent", {}),
-                      ("_ffmpeg_ok", False), ("_stream_unsupported", False),
+                      ("_ffmpeg_ok", False), ("_ffmpeg_task", None),
+                      ("_stream_unsupported", False),
                       ("_upload_cache", {}), ("_cached_videos", {}),
-                      ("_video_failures", {}), ("_asr_tasks", {}),
+                      ("_video_failures", {}), ("_video_failure_times", {}),
+                      ("_asr_tasks", {}),
                       ("_tasks", {}), ("_task_seq", {}), ("_chat_running", {}),
                       ("_global_running", 0), ("_slot_events", {}),
                       ("_notice_buffer", {}), ("_flushing", set()),
-                      ("_notice_tasks", set()),
+                      ("_notice_tasks", set()), ("_notice_retries", {}),
                       ("_background_tasks", set()), ("_migrated_keys", set()),
                       ("_bg_sem", None), ("_bg_sem_limit", 0)]:
         setattr(inst, attr, val)
@@ -680,7 +695,7 @@ def _b8_no_block():
 # ══════════════════════════════════════════════════════════════
 def main():
     print("=" * 62)
-    print("视频理解插件 v1.17.0 自检")
+    print("视频理解插件 v1.18.0 自检")
     print("=" * 62)
     static_checks()
     behavior_checks()

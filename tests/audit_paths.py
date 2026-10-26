@@ -291,8 +291,10 @@ async def audit_l2_and_threads():
             for heavy, why in [("_scan_all_frames", "目录扫描"),
                                ("_extract_range", "逐帧抽帧"),
                                ("grid_to_base64", "JPEG 编码")]:
+                if heavy == node.name:
+                    continue  # ast.unparse 也包含函数定义名，不能把定义误判为调用
                 if re.search(rf"(?<!\w){heavy}\s*\(", body) and "to_thread" not in body \
-                        and "run_in_executor" not in body:
+                        and "run_in_executor" not in body and "run_subprocess" not in body:
                     issue(False, f"{node.name} 直接调用 {heavy}", why)
 
 

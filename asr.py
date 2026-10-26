@@ -189,12 +189,12 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
         except Exception:
             continue
 
-    def _post(form: dict, use_env_proxy: bool):
+    async def _post(form: dict, use_env_proxy: bool):
         with open(p, "rb") as fh:
             files = {"file": (p.name, fh, mime)}
-            with httpx.Client(headers=headers, timeout=tmo,
-                              follow_redirects=True, trust_env=use_env_proxy) as c:
-                return c.post(url, data=form, files=files)
+            async with httpx.AsyncClient(headers=headers, timeout=tmo,
+                                         follow_redirects=True, trust_env=use_env_proxy) as c:
+                return await c.post(url, data=form, files=files)
 
     base_form = {"model": model or "whisper-1"}
     if language:
@@ -223,13 +223,11 @@ async def transcribe(audio_path: str, base_url: str, api_key: str, model: str, *
         dict(base_form),                       # 最后退回默认（只要文本）
     ]
 
-    import asyncio
-    loop = asyncio.get_event_loop()
     last_err = None
     for form in attempts:
         for flag in ([use_proxy] if use_proxy else [False, True]):
             try:
-                resp = await loop.run_in_executor(None, _post, form, flag)
+                resp = await _post(form, flag)
             except Exception as e:
                 last_err = f"{type(e).__name__}: {e}"
                 continue

@@ -6,6 +6,8 @@ LLM 代理 — 多模型路由 + API 调用
 """
 from __future__ import annotations
 
+import asyncio
+import base64
 import json
 
 from openai import AsyncOpenAI
@@ -133,6 +135,11 @@ def _fts(s: float) -> str:
     return f"{m:02d}:{s - m * 60:06.3f}"
 
 
+def _encode_video_file(video_path: str) -> str:
+    with open(video_path, "rb") as f:
+        return base64.b64encode(f.read()).decode("utf-8")
+
+
 async def analyze_gemini_native(profile: "ModelProfile", video_path: str,
                                  question: str, default_prompt: str) -> str:
     """Gemini **原生** generateContent（inline_data 传视频）。
@@ -143,14 +150,13 @@ async def analyze_gemini_native(profile: "ModelProfile", video_path: str,
     受 Gemini inline 请求上限约束（约 20MB，base64 后算），超了会抛错，
     由上层自动降级到帧模式。
     """
-    import base64, os, httpx
+    import os, httpx
     size_mb = os.path.getsize(video_path) / (1024 * 1024)
     if size_mb > NATIVE_MAX_MB:
         raise RuntimeError(
             f"视频 {size_mb:.1f}MB 超过 Gemini 内联上限 {NATIVE_MAX_MB}MB，已改用帧模式"
         )
-    with open(video_path, "rb") as f:
-        b64 = base64.b64encode(f.read()).decode("utf-8")
+    b64 = await asyncio.to_thread(_encode_video_file, video_path)
 
     base = (profile.api_base or "https://generativelanguage.googleapis.com/v1beta").rstrip("/")
     # 归一化成 Gemini 原生路径：
@@ -193,24 +199,20 @@ async def analyze_gemini_native(profile: "ModelProfile", video_path: str,
 
 async def analyze_frames(profile: ModelProfile, grids: list[str],
                           meta: str, question: str, default_prompt: str) -> str:
-    """拼图帧分析。
-
-    grids 为空 = 纯文字模式（会话画面帧被回收后仍可基于文字资料追问）：
-    此时只发文本，不做任何 vision 假设。
-    """
-    client = AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base)
+    """拼图帧分析；客户端无论成功或异常都显式关闭。"""
     content = [{"type": "text", "text": meta}]
     for b in grids:
         content.append({"type": "image_url", "image_url": {"url": b, "detail": "high"}})
     tail = (default_prompt + "\n\n" + question) if default_prompt else question
     content.append({"type": "text", "text": tail})
-    resp = await client.chat.completions.create(
-        model=profile.name,
-        messages=[{"role": "user", "content": content}],
-        timeout=180, max_tokens=4096,
-        extra_headers=profile.extra_headers or None,
-        extra_body=profile.extra_body or None,
-    )
+    async with AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base) as client:
+        resp = await client.chat.completions.create(
+            model=profile.name,
+            messages=[{"role": "user", "content": content}],
+            timeout=180, max_tokens=4096,
+            extra_headers=profile.extra_headers or None,
+            extra_body=profile.extra_body or None,
+        )
     return resp.choices[0].message.content or "(无回复)"
 
 
@@ -222,7 +224,7 @@ async def analyze_native(profile: ModelProfile, video_path: str,
     video_url 给定时直接用该公网链接（模型自行拉流，不受本地体积限制）；
     否则把本地文件 base64 内联（受 NATIVE_MAX_MB 限制）。
     """
-    import base64, os
+    import os
     # ⚠️ 硬约束：配置为 frames 的模型组**绝不能**走原生视频调用。
     #    这类模型可能根本不支持 video_url（只吃 image_url），传了会失败或行为异常。
     #    这里做防御性拦截 —— 即使将来某处调用点写错，也会立刻暴露而不是静默走错。
@@ -266,21 +268,20 @@ async def analyze_native(profile: ModelProfile, video_path: str,
             raise RuntimeError(
                 f"视频 {size_mb:.1f}MB 超过原生模式上限 {NATIVE_MAX_MB}MB（base64 后约 ×1.33），已改用帧模式"
             )
-        with open(video_path, "rb") as f:
-            b64 = base64.b64encode(f.read()).decode("utf-8")
+        b64 = await asyncio.to_thread(_encode_video_file, video_path)
         url = f"data:video/mp4;base64,{b64}"
-    client = AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base)
-    resp = await client.chat.completions.create(
-        model=profile.name,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "video_url", "video_url": {"url": url}},
-                {"type": "text", "text": default_prompt + "\n\n" + question},
-            ],
-        }],
-        timeout=300, max_tokens=4096,
-        extra_headers=profile.extra_headers or None,
-        extra_body=profile.extra_body or None,
-    )
+    async with AsyncOpenAI(api_key=profile.api_key, base_url=profile.api_base) as client:
+        resp = await client.chat.completions.create(
+            model=profile.name,
+            messages=[{
+                "role": "user",
+                "content": [
+                    {"type": "video_url", "video_url": {"url": url}},
+                    {"type": "text", "text": default_prompt + "\n\n" + question},
+                ],
+            }],
+            timeout=300, max_tokens=4096,
+            extra_headers=profile.extra_headers or None,
+            extra_body=profile.extra_body or None,
+        )
     return resp.choices[0].message.content or "(无回复)"

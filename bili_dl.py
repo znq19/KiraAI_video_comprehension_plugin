@@ -6,13 +6,16 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import re
-import subprocess
+import shutil
 import time
 import urllib.parse
 from pathlib import Path
 
 import httpx
+
+from process_utils import run_subprocess
 
 try:                      # 有 KiraAI 就用它的 logger，没有也不影响独立使用
     from core.plugin import logger
@@ -60,16 +63,33 @@ class _Requester:
             if self.proxy_mode != "auto": raise
             return await self._get_once(url, params, True)
     async def stream(self, url, fpath):
+        """流式写 .part，成功后原子替换；网络取消时不会留下半截正式缓存。"""
+        fpath = Path(fpath)
+        tmp = Path(str(fpath) + ".part")
         for use_proxy in (False, True):
             try:
                 async with _client(self.cookie, self.timeout, use_proxy) as c:
                     async with c.stream("GET", url) as resp:
-                        if resp.status_code != 200: raise BiliError(f"下载失败 HTTP {resp.status_code}")
-                        with open(fpath, "wb") as f:
-                            async for chunk in resp.aiter_bytes(8192): f.write(chunk)
+                        if resp.status_code != 200:
+                            raise BiliError(f"下载失败 HTTP {resp.status_code}")
+                        with open(tmp, "wb") as f:
+                            async for chunk in resp.aiter_bytes(1024 * 1024):
+                                await asyncio.to_thread(f.write, chunk)
+                await asyncio.to_thread(os.replace, tmp, fpath)
                 return
             except (BiliNetError, httpx.HTTPError):
-                if self.proxy_mode != "auto" or use_proxy: raise
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                if self.proxy_mode != "auto" or use_proxy:
+                    raise
+            except BaseException:
+                try:
+                    tmp.unlink()
+                except OSError:
+                    pass
+                raise
 
 
 # WBI 签名固定重排表（B站前端 mixinKeyEncTab）
@@ -214,17 +234,22 @@ async def _get_video_urls(req, bvid, cid, quality_hint: int = 0):
     audio = dash.get("audio", [])
     audio_url = audio[0]["baseUrl"] if audio else None
 
-    # 按质量选择视频流（DASH 默认从高到低排）
-    video_url = None
+    # original 必须选最高档；低/中档选不超过上限的最高流，都不依赖 API 返回顺序。
+    def _num(v, key):
+        try:
+            return int(v.get(key, 0) or 0)
+        except (TypeError, ValueError):
+            return 0
+
+    ordered = sorted(video, key=lambda v: (_num(v, "height"), _num(v, "bandwidth")),
+                     reverse=True)
+    chosen = None
     if quality_hint > 0:
-        # 取第一个不超过 quality_hint 高度的流（越小越省流量）
-        for v in video:
-            h = int(v.get("height", 0) or 0)
-            if 0 < h <= quality_hint:
-                video_url = v["baseUrl"]
-                break
-    if not video_url and video:
-        video_url = video[-1]["baseUrl"]  # 兜底：最低质量
+        candidates = [v for v in ordered if 0 < _num(v, "height") <= quality_hint]
+        chosen = candidates[0] if candidates else (ordered[-1] if ordered else None)
+    elif ordered:
+        chosen = ordered[0]
+    video_url = chosen.get("baseUrl") if chosen else None
     # mp4 兜底
     durl = data.get("durl", [])
     return {"video_url": video_url or (durl[0]["url"] if durl else None), "audio_url": audio_url}
@@ -262,50 +287,74 @@ async def get_bili_direct_url(bvid, cid, cookie="", timeout=30.0, proxy_mode="au
     return url, int(data.get("quality") or 0), int(first.get("length") or 0)
 
 
+def _unlink_quiet(path):
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
+
+
+async def _valid_cached_video(path) -> bool:
+    """非空还不够：有 ffprobe 时必须能解析出正时长，排除旧半截缓存。"""
+    p = Path(path)
+    try:
+        if not p.is_file() or p.stat().st_size == 0:
+            return False
+    except OSError:
+        return False
+    if not shutil.which("ffprobe"):
+        return True
+    cmd = ["ffprobe", "-v", "error", "-show_entries", "format=duration",
+           "-of", "json", str(p)]
+    try:
+        r = await run_subprocess(cmd, timeout=30)
+        if r.returncode != 0:
+            return False
+        duration = float((json.loads(r.stdout or "{}").get("format") or {}).get("duration") or 0)
+        return duration > 0
+    except Exception:
+        return False
+
+
 async def download_bili_video(bvid, out_dir, info=None, cookie="",
                                timeout=120.0, max_seconds=0, proxy_mode="auto",
                                quality: str = "",
                                prefer_html5: bool = True) -> tuple[str, dict]:
-    """下载 B 站视频。
-
-    默认先走 **html5 MP4 直链**：单文件、音视频合一、不用 ffmpeg 合并、
-    也不需要 Referer —— 少下一个流、少一步合并，更快更稳。
-    拿不到（接口变动/风控/无 MP4 源）自动回退原来的 DASH 流程。
-    """
-    quality_hint = {"low": 360, "medium": 720, "original": 0}.get(quality, 360)
-    out_dir = Path(out_dir); out_dir.mkdir(parents=True, exist_ok=True)
+    """按质量下载并原子写缓存；low 保留 html5 免合并优先策略。"""
+    quality = quality if quality in ("low", "medium", "original") else "low"
+    quality_hint = {"low": 360, "medium": 720, "original": 0}[quality]
+    # medium/original 需要对应 DASH 档，不能被 html5 的较低清晰度悄悄替代。
+    prefer_html5 = bool(prefer_html5 and quality == "low")
+    out_dir = Path(out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
     req = _Requester(cookie, timeout, proxy_mode)
     info = info or await get_bili_info(bvid, cookie, timeout, proxy_mode)
     if max_seconds and info["duration"] > max_seconds:
         raise BiliError(f"视频时长 {info['duration']}s 超过上限 {max_seconds}s")
-    fname = f"{bvid}.mp4"
+    # 保留旧 low 文件命名；其他质量分开缓存，避免低清文件冒充原画。
+    fname = f"{bvid}.mp4" if quality == "low" else f"{bvid}_{quality}.mp4"
     fpath = out_dir / fname
-    if fpath.exists() and fpath.stat().st_size > 0:
+    if await _valid_cached_video(fpath):
         return str(fpath), info
 
-    # ① 优先：html5 MP4 单文件（免合并）
     if prefer_html5:
         try:
             direct, qcode, _ms = await get_bili_direct_url(
                 bvid, info["cid"], cookie, timeout, proxy_mode)
             await req.stream(direct, fpath)
-            if fpath.exists() and fpath.stat().st_size > 0:
+            if await _valid_cached_video(fpath):
                 logger.info("[VC] B站视频下载完成（html5 MP4 单文件，quality=%s）", qcode)
                 return str(fpath), info
         except Exception as e:
             logger.info("[VC] html5 MP4 直链不可用，回退 DASH 流程: %s", e)
-            try:
-                if fpath.exists(): fpath.unlink()
-            except Exception:
-                pass
+            _unlink_quiet(str(fpath) + ".part")
 
-    # ② 回退：DASH（视频流 + 音频流 + ffmpeg 合并）
     urls = await _get_video_urls(req, bvid, info["cid"], quality_hint=quality_hint)
-    if not urls["video_url"]: raise BiliError("无法获取视频下载链接")
+    if not urls["video_url"]:
+        raise BiliError("无法获取视频下载链接")
 
-    vpath = out_dir / f"{bvid}_v.mp4"
-    apath = out_dir / f"{bvid}_a.m4a"
-
+    vpath = out_dir / f"{fpath.stem}_v.mp4"
+    apath = out_dir / f"{fpath.stem}_a.m4a"
     await req.stream(urls["video_url"], vpath)
     if not vpath.exists() or vpath.stat().st_size == 0:
         raise BiliError("视频流下载文件为空")
@@ -316,38 +365,43 @@ async def download_bili_video(bvid, out_dir, info=None, cookie="",
             await req.stream(urls["audio_url"], apath)
             if not apath.exists() or apath.stat().st_size == 0:
                 has_audio = False
-        except: has_audio = False
+        except Exception:
+            has_audio = False
 
     if has_audio:
+        merge_path = out_dir / f".{fpath.stem}_merge.mp4"
         try:
-            # ffmpeg 合并最长 300 秒：必须放线程池，否则整条事件循环被钉住
-            # （消息收发、WS 心跳、其它协程全部停摆）。
-            r = await asyncio.to_thread(
-                subprocess.run,
-                [
-                    "ffmpeg", "-y", "-i", str(vpath), "-i", str(apath),
-                    "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
-                    "-movflags", "+faststart", str(fpath),
-                ],
-                capture_output=True, text=True, timeout=300,
-            )
-            if r.returncode == 0:
-                try: vpath.unlink()
-                except: pass
-                try: apath.unlink()
-                except: pass
-            else:
+            r = await run_subprocess([
+                "ffmpeg", "-y", "-i", str(vpath), "-i", str(apath),
+                "-c:v", "copy", "-c:a", "aac", "-b:a", "128k",
+                "-movflags", "+faststart", str(merge_path),
+            ], timeout=300)
+            if r.returncode != 0:
                 raise BiliError(f"音视频合并失败: {r.stderr[:200]}")
+            await asyncio.to_thread(os.replace, merge_path, fpath)
+            _unlink_quiet(vpath)
+            _unlink_quiet(apath)
         except FileNotFoundError:
-            # ffmpeg 不可用（Windows），降级：仅视频流无音轨
-            import shutil; shutil.move(str(vpath), str(fpath))
+            # 没有 ffmpeg 时保留旧降级：仅视频流，不伪称含音轨。
+            await asyncio.to_thread(os.replace, vpath, fpath)
+        except asyncio.CancelledError:
+            _unlink_quiet(merge_path)
+            _unlink_quiet(vpath)
+            _unlink_quiet(apath)
+            raise
         except Exception as e:
-            raise BiliError(f"音视频合并异常: {e}")
+            _unlink_quiet(merge_path)
+            _unlink_quiet(vpath)
+            _unlink_quiet(apath)
+            if isinstance(e, BiliError):
+                raise
+            raise BiliError(f"音视频合并异常: {e}") from e
     else:
-        import shutil; shutil.move(str(vpath), str(fpath))
+        await asyncio.to_thread(os.replace, vpath, fpath)
 
-    if not fpath.exists() or fpath.stat().st_size == 0:
-        raise BiliError("最终视频文件为空")
+    _unlink_quiet(apath)
+    if not await _valid_cached_video(fpath):
+        raise BiliError("最终视频文件无效或不完整")
     return str(fpath), info
 
 

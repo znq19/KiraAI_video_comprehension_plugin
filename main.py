@@ -20,7 +20,6 @@ import math
 import os
 import re
 import shutil
-import subprocess
 import sys
 import time
 import uuid
@@ -36,18 +35,20 @@ from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
 from core.chat.message_elements import Text
 from core.provider import LLMRequest
+from core.prompt_manager import Prompt
 from core.utils.path_utils import get_data_path
 
+from process_utils import stop_process
 from video_processor import (process_video, compress_video, clip_video, download_video,
-                             extract_audio, detect_speech_ranges, merge_ranges, slice_audio)
+                             extract_audio, detect_speech_ranges, merge_ranges, slice_audio,
+                             get_video_info_async)
 from asr import (transcribe as asr_transcribe, build_timeline_doc, ASRError,
                   normalize_segments_by_duration)
 from video_host import upload_to_any, UploadError, DEFAULT_HOSTS as DEFAULT_UPLOAD_HOSTS
 from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
                        analyze_native, NATIVE_MAX_MB, _as_dict)
 from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_video,
-                     extract_bvid, BiliError, get_bilibili_subtitle,
-                     get_bili_direct_url)
+                     extract_bvid, get_bilibili_subtitle, get_bili_direct_url)
 
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
 
@@ -57,49 +58,41 @@ BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/
 # 与 WS 心跳。抽成同步函数后用 to_thread 执行，行为与原实现逐步一致。
 
 def _extract_static_ffmpeg_windows(blob: bytes, static_dir: str) -> bool:
-    """解压 Windows 静态 ffmpeg zip，返回是否成功（原逻辑逐行保留）。"""
+    """只写出 ffmpeg.exe/ffprobe.exe，两个都存在才成功；不释放包内目录。"""
     import io
     import zipfile
 
+    got = set()
     with zipfile.ZipFile(io.BytesIO(blob)) as zf:
-        got = False
         for name in zf.namelist():
-            if name.endswith(("ffmpeg.exe", "ffprobe.exe")):
-                zf.extract(name, static_dir)
-                exe_path = os.path.join(static_dir, name)
-                shutil.move(exe_path, os.path.join(static_dir, os.path.basename(name)))
-                got = True
-    if got:
-        # 清理多余文件
-        for d in os.listdir(static_dir):
-            dp = os.path.join(static_dir, d)
-            if os.path.isdir(dp) and d.startswith("ffmpeg"):
-                shutil.rmtree(dp, ignore_errors=True)
-    return got
+            base = name.replace("\\", "/").rsplit("/", 1)[-1]
+            if base not in ("ffmpeg.exe", "ffprobe.exe"):
+                continue
+            with zf.open(name) as src, open(os.path.join(static_dir, base), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            got.add(base)
+    return got == {"ffmpeg.exe", "ffprobe.exe"}
 
 
 def _extract_static_ffmpeg_linux(blob: bytes, static_dir: str) -> bool:
-    """解压 Linux 静态 ffmpeg tar.xz，返回是否成功（原逻辑逐行保留）。"""
+    """只写出 ffmpeg/ffprobe，两个都存在才成功；不释放包内目录。"""
     import io
     import tarfile
 
+    got = set()
     with tarfile.open(fileobj=io.BytesIO(blob)) as tar:
-        got = False
         for m in tar.getmembers():
-            base = os.path.basename(m.name)
-            if base in ("ffmpeg", "ffprobe"):
-                tar.extract(m, path=static_dir)
-                exe_path = os.path.join(static_dir, m.name)
-                shutil.move(exe_path, os.path.join(static_dir, base))
-                os.chmod(os.path.join(static_dir, base), 0o755)
-                got = True
-    if got:
-        # 清理
-        for d in os.listdir(static_dir):
-            dp = os.path.join(static_dir, d)
-            if os.path.isdir(dp) and d.startswith("ffmpeg"):
-                shutil.rmtree(dp, ignore_errors=True)
-    return got
+            base = m.name.replace("\\", "/").rsplit("/", 1)[-1]
+            if base not in ("ffmpeg", "ffprobe") or not m.isfile():
+                continue
+            src = tar.extractfile(m)
+            if src is None:
+                continue
+            with src, open(os.path.join(static_dir, base), "wb") as dst:
+                shutil.copyfileobj(src, dst)
+            os.chmod(os.path.join(static_dir, base), 0o755)
+            got.add(base)
+    return got == {"ffmpeg", "ffprobe"}
 
 
 def _collect_chain_text(chain) -> str:
@@ -156,6 +149,10 @@ MAX_SEGMENTS = 5          # 一次最多几段
 MAX_SEGMENT_SEC = 300     # 单段最长秒数
 
 
+class VideoAnalysisError(Exception):
+    """可展示给用户的分析失败；由任务系统标记为 failed，而非假完成。"""
+
+
 class VideoSession:
     __slots__ = (
         "session_id", "sid", "source", "source_url", "title",
@@ -196,6 +193,10 @@ class VideoSession:
     def add_turn(self, q: str, a: str):
         self.history.append({"role": "user", "text": q})
         self.history.append({"role": "bot", "text": a})
+        # 当前追问路径不读取 history，不能把它的语义偷偷接进模型输入；
+        # 只限制内存占用，保留最近 40 轮问答，现有回答行为完全不变。
+        if len(self.history) > 80:
+            del self.history[:-80]
         self.last_interact = time.time()
 
 
@@ -253,13 +254,15 @@ class VideoComprehensionPlugin(BasePlugin):
         self._cleanup: Optional[asyncio.Task] = None
         self._auto_sent: dict[str, dict] = {}  # sid → {bvid, title, file_path, text}
         self._ffmpeg_ok = False
+        self._ffmpeg_task: Optional[asyncio.Task] = None
         self._stream_unsupported = False
         self._upload_cache: dict[str, str] = {}   # 本地路径 → 已上传的公开 URL
         self._cached_videos: dict[str, list] = {}   # sid → [{orig_name, path, rel, size_mb, ts}, ...]
         self._video_failures: dict[str, dict] = {}  # sid → {原文件名: 失败原因}（供消息改写）
+        self._video_failure_times: dict[str, float] = {}  # sid → 最近失败时间（30 分钟后清理）
         self._asr_tasks: dict[str, asyncio.Task] = {}   # 转写缓存 key → 进行中的任务
         # ── 异步分析任务（v1.17.0） ──
-        self._tasks: dict[str, VideoTask] = {}          # task_id → VideoTask
+        self._tasks: dict[str, VideoTask] = {}          # 内部 UUID → VideoTask（显示短号可跨会话重复）
         self._task_seq: dict[str, int] = {}             # sid → 已发放的短号计数
         self._chat_running: dict[str, int] = {}         # sid → 正在跑的分析任务数
         self._global_running = 0
@@ -267,6 +270,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self._notice_buffer: dict[str, list] = {}       # sid → [已完成待合并通告的任务]
         self._flushing: set = set()                     # 正在发通告的会话（防竞态）
         self._notice_tasks: set = set()
+        self._notice_retries: dict[str, int] = {}       # sid → 已连续发布失败次数
         self._background_tasks: set = set()             # 后台任务引用（防被 GC 回收）
         self._migrated_keys: set = set()
         self._bg_sem: Optional[asyncio.Semaphore] = None   # 缓存/转写用的后台闸
@@ -564,12 +568,13 @@ class VideoComprehensionPlugin(BasePlugin):
 
         # 1) 检查 PATH（ffmpeg + ffprobe 都需要）
         ffmpeg_path = shutil.which("ffmpeg")
-        if ffmpeg_path:
-            if not shutil.which("ffprobe"):
-                logger.warning("[VC] ⚠️ ffmpeg 存在但 ffprobe 缺失，抽帧/时长探测会失败")
+        ffprobe_path = shutil.which("ffprobe")
+        if ffmpeg_path and ffprobe_path:
             self._ffmpeg_ok = True
-            logger.info("[VC] ✅ ffmpeg 已可用: %s", ffmpeg_path)
+            logger.info("[VC] ✅ ffmpeg+ffprobe 已可用: %s / %s", ffmpeg_path, ffprobe_path)
             return True
+        if ffmpeg_path and not ffprobe_path:
+            logger.warning("[VC] ffmpeg 存在但 ffprobe 缺失，将继续安装/补齐")
 
         import platform as _pf
         system = _pf.system().lower()
@@ -581,28 +586,39 @@ class VideoComprehensionPlugin(BasePlugin):
                             ("apt-get", ["apt-get", "install", "-y", "ffmpeg"])]:
                 try:
                     which_pm = shutil.which(pm)
-                    if not which_pm: continue
+                    if not which_pm:
+                        continue
                     proc = await asyncio.create_subprocess_exec(
                         *cmd, stdout=asyncio.subprocess.DEVNULL,
                         stderr=asyncio.subprocess.DEVNULL,
                     )
-                    if await proc.wait() == 0 and shutil.which("ffmpeg"):
+                    try:
+                        rc = await proc.wait()
+                    except asyncio.CancelledError:
+                        await asyncio.shield(stop_process(proc))
+                        raise
+                    if rc == 0 and shutil.which("ffmpeg") and shutil.which("ffprobe"):
                         self._ffmpeg_ok = True
-                        logger.info("[VC] ✅ ffmpeg 通过 %s 安装成功", pm)
+                        logger.info("[VC] ✅ ffmpeg+ffprobe 通过 %s 安装成功", pm)
                         return True
-                except: continue
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    logger.debug("[VC] %s 安装 ffmpeg 失败，尝试下一方式: %s", pm, e)
 
         # 3) 下载静态 ffmpeg（Win/Linux 通用兜底）
         static_dir = os.path.join(self.bili_cache_dir, ".ffmpeg")
         os.makedirs(static_dir, exist_ok=True)
         exe_name = "ffmpeg.exe" if system == "windows" else "ffmpeg"
+        probe_name = "ffprobe.exe" if system == "windows" else "ffprobe"
         static_bin = os.path.join(static_dir, exe_name)
+        static_probe = os.path.join(static_dir, probe_name)
 
-        # 检查之前是否已下载
-        if os.path.isfile(static_bin):
+        # 之前是否已完整下载（只有两个都在才可复用）
+        if os.path.isfile(static_bin) and os.path.isfile(static_probe):
             os.environ["PATH"] = static_dir + os.pathsep + os.environ.get("PATH", "")
             self._ffmpeg_ok = True
-            logger.info("[VC] ✅ 使用已下载的静态 ffmpeg: %s", static_bin)
+            logger.info("[VC] ✅ 使用已下载的静态 ffmpeg+ffprobe: %s", static_bin)
             return True
 
         logger.info("[VC] ⬇️ 下载静态 ffmpeg → %s ...", static_bin)
@@ -650,7 +666,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.enabled: return
         # 后台异步安装 ffmpeg（首条日志提示用户）
         logger.info("[VC] 🔍 检查 ffmpeg...（若缺失将后台自动安装，视频压缩/抽帧需要它）")
-        asyncio.create_task(self._ensure_ffmpeg_async())
+        self._ffmpeg_task = self._spawn(self._ensure_ffmpeg_async(), name="vc_ffmpeg_setup")
         os.makedirs(self.bili_cache_dir, exist_ok=True)
         os.makedirs(self.other_cache_dir, exist_ok=True)
         await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache, self.bili_cleanup, "B站")
@@ -674,33 +690,56 @@ class VideoComprehensionPlugin(BasePlugin):
     async def terminate(self):
         if self._cleanup and not self._cleanup.done():
             self._cleanup.cancel()
-            try: await self._cleanup
-            except asyncio.CancelledError: pass
-        # 取消所有后台分析任务与待合并通告
+            try:
+                await self._cleanup
+            except asyncio.CancelledError:
+                pass
+        # 先取消所有来源，再统一等待收尾，最后清表；不能只 clear 让任务裸跑。
+        if self._ffmpeg_task and not self._ffmpeg_task.done():
+            self._ffmpeg_task.cancel()
         for t in list(self._tasks.values()):
             if t.asyncio_task and not t.asyncio_task.done():
                 t.cancel_requested = True
                 t.asyncio_task.cancel()
             if t.queue_timer and not t.queue_timer.done():
                 t.queue_timer.cancel()
-        self._tasks.clear()
         for nt in list(self._notice_tasks):
             if not nt.done():
                 nt.cancel()
-        self._notice_tasks.clear()
         for bt in list(self._background_tasks):
             if not bt.done():
                 bt.cancel()
-        self._background_tasks.clear()
-        self._notice_buffer.clear()
-        self._flushing.clear()
-        self._pending.clear(); self._sessions.clear(); self._sid_sessions.clear()
-        self._cached_videos.clear()
-        self._video_failures.clear()
         for t in list(self._asr_tasks.values()):
             if not t.done():
                 t.cancel()
+        wait_for = {t for t in self._background_tasks if not t.done()}
+        wait_for.update(t for t in self._asr_tasks.values() if not t.done())
+        if wait_for:
+            await asyncio.gather(*wait_for, return_exceptions=True)
+
+        self._tasks.clear()
+        self._notice_tasks.clear()
+        self._background_tasks.clear()
         self._asr_tasks.clear()
+        self._ffmpeg_task = None
+        self._notice_buffer.clear()
+        self._notice_retries.clear()
+        self._flushing.clear()
+        self._pending.clear()
+        self._sessions.clear()
+        self._sid_sessions.clear()
+        self._cached_videos.clear()
+        self._video_failures.clear()
+        self._video_failure_times.clear()
+        self._auto_sent.clear()
+        self._upload_cache.clear()
+        self._locks.clear()
+        self._task_seq.clear()
+        self._slot_events.clear()
+        self._chat_running.clear()
+        self._global_running = 0
+        self._bg_sem = None
+        self._bg_sem_limit = 0
 
     # ── 缓存清理（通用） ──
 
@@ -715,48 +754,74 @@ class VideoComprehensionPlugin(BasePlugin):
                     pass
         return total
 
-    def _scan_cache(self, cache_dir: str, max_files: int, cleanup_n: int, label: str = "",
-                    ttl_hours: float = 0, max_total_mb: float = 0):
-        """返回待删除条目名列表。
+    def _active_cache_entries(self) -> set[str]:
+        """正在生成/使用的隐藏缓存，清理时不能抢删。"""
+        names = set()
+        for key, task in list(self._asr_tasks.items()):
+            if not task.done():
+                names.add(f".asr_{key}")
+                names.add(os.path.join(".transcripts", f"{key}.json"))
+        return names
 
-        三个维度叠加：① 超龄(TTL) → ② 超总容量 → ③ 超条数。
-        文件与「分析子目录」都算条目（子目录按其中所有文件的总大小计）。
+    def _scan_cache(self, cache_dir: str, max_files: int, cleanup_n: int, label: str = "",
+                    ttl_hours: float = 0, max_total_mb: float = 0,
+                    protected_names=None):
+        """返回待删除相对路径，按 TTL → 总容量 → 条数叠加筛选。
+
+        `.asr_*` 是中间产物目录，按一个条目治理；`.transcripts/*.json`
+        是独立缓存文件，逐文件治理；`.ffmpeg` 与其他隐藏项继续豁免。
         """
+        protected = set(protected_names or ())
         try:
-            if not os.path.isdir(cache_dir): return []
+            if not os.path.isdir(cache_dir):
+                return []
             entries = []
-            for name in os.listdir(cache_dir):
-                if name.startswith("."):
-                    continue  # 跳过 .ffmpeg 等隐藏目录
-                p = os.path.join(cache_dir, name)
+
+            def _add_entry(name, path):
+                if name in protected:
+                    return
                 try:
-                    st = os.stat(p)
+                    st = os.stat(path)
                 except Exception:
-                    continue
-                is_dir = os.path.isdir(p)
+                    return
+                is_dir = os.path.isdir(path) and not os.path.islink(path)
                 entries.append({
                     "name": name, "mtime": st.st_mtime, "is_dir": is_dir,
-                    "size": st.st_size if not is_dir else self._dir_size(p),
+                    "size": st.st_size if not is_dir else self._dir_size(path),
                 })
+
+            for name in os.listdir(cache_dir):
+                p = os.path.join(cache_dir, name)
+                if name == ".transcripts" and os.path.isdir(p):
+                    try:
+                        children = os.listdir(p)
+                    except Exception:
+                        continue
+                    for child in children:
+                        if child.endswith(".json"):
+                            _add_entry(os.path.join(name, child), os.path.join(p, child))
+                    continue
+                if name.startswith(".") and not name.startswith(".asr_"):
+                    continue
+                _add_entry(name, p)
             if not entries:
                 return []
-            entries.sort(key=lambda e: e["mtime"])   # 最旧优先
+            entries.sort(key=lambda e: e["mtime"])
             to_del = []
             keep = entries
-            # ① TTL：超龄一律删
             if ttl_hours and ttl_hours > 0:
                 cutoff = time.time() - ttl_hours * 3600
                 to_del = [e for e in entries if e["mtime"] < cutoff]
                 keep = [e for e in entries if e["mtime"] >= cutoff]
-            # ② 总容量超限：从最旧的删起
             if max_total_mb and max_total_mb > 0:
                 limit = max_total_mb * 1024 * 1024
                 total = sum(e["size"] for e in keep)
                 i = 0
                 while total > limit and i < len(keep):
-                    to_del.append(keep[i]); total -= keep[i]["size"]; i += 1
+                    to_del.append(keep[i])
+                    total -= keep[i]["size"]
+                    i += 1
                 keep = keep[i:]
-            # ③ 条数超限：删最旧的若干（不超过实际超出的数量）
             if max_files and max_files > 0 and len(keep) > max_files:
                 n = min(cleanup_n, len(keep) - max_files)
                 to_del.extend(keep[:n])
@@ -765,45 +830,79 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 缓存[%s]扫描异常: %s", label or cache_dir, e)
             return []
 
+    @staticmethod
+    def _remove_cache_entry(path: str):
+        # 符号链接只 unlink，绝不递归到链接目标。
+        if os.path.isdir(path) and not os.path.islink(path):
+            shutil.rmtree(path)
+        else:
+            os.remove(path)
+
     async def _do_cleanup(self, cache_dir: str, max_files: int, cleanup_n: int, label: str = "",
-                          ttl_hours: float = 0, max_total_mb: float = 0):
-        to_del = self._scan_cache(cache_dir, max_files, cleanup_n, label,
-                                  ttl_hours=ttl_hours, max_total_mb=max_total_mb)
-        if not to_del: return
+                          ttl_hours: float = 0, max_total_mb: float = 0, protected_names=None):
+        if protected_names is None:
+            protected_names = self._active_cache_entries()
+        to_del = await asyncio.to_thread(
+            self._scan_cache, cache_dir, max_files, cleanup_n, label,
+            ttl_hours, max_total_mb, protected_names)
+        if not to_del:
+            return
         deleted = 0
         for name in to_del:
+            # 扫描后新启动的任务也要排除；每轮删除本身都在线程外执行。
+            if name in self._active_cache_entries():
+                continue
             p = os.path.join(cache_dir, name)
             try:
-                if os.path.isdir(p):
-                    shutil.rmtree(p, ignore_errors=True)
-                else:
-                    os.remove(p)
+                await asyncio.to_thread(self._remove_cache_entry, p)
                 deleted += 1
-            except: pass
-            await asyncio.sleep(0)
-        try:
-            remain = len([x for x in os.listdir(cache_dir) if not x.startswith(".")])
-        except Exception:
-            remain = 0
+            except OSError as e:
+                logger.warning("[VC] 缓存删除失败[%s]: %s", p, e)
+        remain = len(await asyncio.to_thread(self._scan_cache, cache_dir, 0, 0, label))
         logger.info("[VC] 缓存清理[%s]: 删%d个余%d个", label or cache_dir, deleted, remain)
 
     async def _cleanup_loop(self):
         while True:
-            await asyncio.sleep(300)
-            await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache, self.bili_cleanup, "B站")
-            await self._do_cleanup(self.other_cache_dir, self.other_max_cache, self.other_cleanup, "其他",
-                                   ttl_hours=self.cache_ttl_hours,
-                                   max_total_mb=self.cache_max_total_mb)
-            stale = [k for k, v in self._sessions.items() if v.is_stale(self.session_ttl)]
-            for k in stale:
-                self._sessions.pop(k, None)
-                for sl in self._sid_sessions.values():
-                    if k in sl: sl.remove(k)
-            self._sid_sessions = {k: v for k, v in self._sid_sessions.items() if v}
-            # 未被告知 bot 的缓存记录（30 分钟未用则丢弃）
-            _now = time.time()
-            self._cached_videos = {k: [c for c in v if _now - c.get("ts", 0) < 1800]
-                                   for k, v in self._cached_videos.items() if v}
+            try:
+                await asyncio.sleep(300)
+                await self._do_cleanup(self.bili_cache_dir, self.bili_max_cache,
+                                       self.bili_cleanup, "B站")
+                await self._do_cleanup(self.other_cache_dir, self.other_max_cache,
+                                       self.other_cleanup, "其他",
+                                       ttl_hours=self.cache_ttl_hours,
+                                       max_total_mb=self.cache_max_total_mb,
+                                       protected_names=self._active_cache_entries())
+                active_sessions = {t.session_id for t in self._tasks.values()
+                                   if t.state in ("queued", "running") and t.session_id}
+                stale = [k for k, v in self._sessions.items()
+                         if v.is_stale(self.session_ttl) and k not in active_sessions]
+                for k in stale:
+                    self._sessions.pop(k, None)
+                    for sl in self._sid_sessions.values():
+                        if k in sl:
+                            sl.remove(k)
+                self._sid_sessions = {k: v for k, v in self._sid_sessions.items() if v}
+                now = time.time()
+                fresh = {}
+                for sid, records in self._cached_videos.items():
+                    kept = [c for c in records if now - c.get("ts", 0) < 1800]
+                    if kept:
+                        fresh[sid] = kept
+                self._cached_videos = fresh
+                for sid, sent in list(self._auto_sent.items()):
+                    if now - float(sent.get("ts") or 0) > 300:
+                        self._auto_sent.pop(sid, None)
+                for sid, pending in list(self._pending.items()):
+                    if now - float(pending.get("ts") or 0) > 600:
+                        self._pending.pop(sid, None)
+                for sid, ts in list(self._video_failure_times.items()):
+                    if now - ts > 1800:
+                        self._video_failure_times.pop(sid, None)
+                        self._video_failures.pop(sid, None)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("[VC] 缓存清理循环异常（5 分钟后继续）")
 
     def _sid(self, event) -> str:
         return getattr(event.session, "sid", None) or getattr(event, "sid", "") or ""
@@ -928,9 +1027,29 @@ class VideoComprehensionPlugin(BasePlugin):
         # 顺手清理无人持有的锁，避免长期运行后无限增长
         if len(self._locks) > 512:
             for k in [k for k, v in self._locks.items()
-                      if not v.locked() and k != key][:256]:
+                      if not v.locked() and not getattr(v, "_waiters", None)
+                      and k != key][:256]:
                 self._locks.pop(k, None)
         return lock
+
+    def _compression_cache_path(self, base_dir: str, prefix: str, src: str,
+                                max_width: int, crf: int) -> str:
+        st = os.stat(src)
+        raw = (f"{os.path.abspath(src)}:{st.st_size}:{st.st_mtime_ns}:"
+               f"{max_width}:{crf}")
+        digest = hashlib.sha256(raw.encode("utf-8")).hexdigest()[:16]
+        stem = re.sub(r"[^\w.\-]+", "_", Path(src).stem)[:48] or "video"
+        return os.path.join(base_dir, f"{prefix}_{stem}_{digest}.mp4")
+
+    async def _compress_cached(self, src: str, out_path: str,
+                               max_width: int, crf: int) -> str:
+        """同源同参数复用完整压缩结果；并发同键只转码一次。"""
+        async with self._session_lock(f"compress:{out_path}"):
+            if os.path.isfile(out_path) and os.path.getsize(out_path) > 0:
+                info = await get_video_info_async(out_path)
+                if float(info.get("duration") or 0) > 0:
+                    return out_path
+            return await compress_video(src, out_path, max_width=max_width, crf=crf)
 
     # ══════════════════════════════════════════════════════════════
     #  异步分析任务系统（v1.17.0）
@@ -977,8 +1096,9 @@ class VideoComprehensionPlugin(BasePlugin):
             self._chat_running[sid] = self._running_count(sid) - 1
         if self._global_running > 0:
             self._global_running -= 1
-        ev = self._slot_events.get(sid)
-        if ev is not None:
+        # 释放的可能不仅是本会话槽，也可能是全局槽。只唤醒同会话会让
+        # 其他会话在已有空位时仍白等 0.5s 轮询；唤醒全部后仍由计数闸裁决。
+        for ev in list(self._slot_events.values()):
             ev.set()
 
     def _new_task_id(self, sid: str) -> str:
@@ -1006,12 +1126,22 @@ class VideoComprehensionPlugin(BasePlugin):
         return " | ".join(parts)
 
     def _prune_tasks(self):
-        """清理过期任务记录（只在完成态里挑）"""
+        """清理过期任务记录及不再使用的会话序号/事件。"""
         cutoff = time.time() - self.task_keep_minutes * 60
         for tid in [k for k, v in self._tasks.items()
                     if v.state in ("done", "failed", "rejected", "cancelled")
                     and (v.finished_at or v.created_at) < cutoff]:
             self._tasks.pop(tid, None)
+        live_sids = {t.sid for t in self._tasks.values()}
+        for sid in list(self._task_seq):
+            if sid not in live_sids:
+                self._task_seq.pop(sid, None)
+        for sid in list(self._slot_events):
+            if sid not in live_sids and self._running_count(sid) <= 0:
+                self._slot_events.pop(sid, None)
+        for sid in list(self._chat_running):
+            if sid not in live_sids and self._running_count(sid) <= 0:
+                self._chat_running.pop(sid, None)
 
     # ── 提交（L1：永不阻塞） ──
 
@@ -1023,7 +1153,8 @@ class VideoComprehensionPlugin(BasePlugin):
         """
         self._prune_tasks()
         task = VideoTask(self._new_task_id(sid), sid, kind, title, detail, dup_key=dup_key)
-        self._tasks[task.task_id] = task
+        # 短号按会话生成，可能跨会话相同；内部键必须独立唯一。
+        self._tasks[uuid.uuid4().hex] = task
 
         if kind == "followup":
             task.state = "running"
@@ -1191,29 +1322,41 @@ class VideoComprehensionPlugin(BasePlugin):
                 self._notice_tasks.discard(t)
                 continue
             if t.get_name() == name:
-                return                      # 已有排队的 flush，等它就行
+                return
         nt = self._spawn(self._notice_flush_later(sid), name=name)
         self._notice_tasks.add(nt)
         nt.add_done_callback(self._notice_tasks.discard)
 
-    async def _notice_flush_later(self, sid: str):
+    def _schedule_notice_retry(self, sid: str):
+        """发布失败后保留结果并退避重试；持续失败只告警，不高速刷接口。"""
+        count = self._notice_retries.get(sid, 0) + 1
+        self._notice_retries[sid] = count
+        if count > 5:
+            logger.error("[VC] 通告连续 %d 次发布失败 → %s；结果仍保留在缓冲，等待后续触发",
+                         count - 1, sid)
+            return
+        name = f"vc_notice_retry_{sid}"
+        for t in list(self._notice_tasks):
+            if not t.done() and t.get_name() == name:
+                return
+        delay = min(60, 5 * (2 ** (count - 1)))
+        nt = self._spawn(self._notice_flush_later(sid, delay), name=name)
+        self._notice_tasks.add(nt)
+        nt.add_done_callback(self._notice_tasks.discard)
+
+    async def _notice_flush_later(self, sid: str, delay: float | None = None):
         try:
-            await asyncio.sleep(self.notice_coalesce_sec)
+            await asyncio.sleep(self.notice_coalesce_sec if delay is None else delay)
         except asyncio.CancelledError:
             return
         await self._flush_notices(sid)
 
     async def _flush_notices(self, sid: str):
-        """把缓冲里的任务组装成通告并发出去。
-
-        ⚠️ 原先的实现有个竞态：**在 await publish_notice 期间新完成的任务**，
-        因为「同名 flush 任务还没 done」而不会再排 flush ⇒ 那条通知就卡在
-        buffer 里，直到下一次有任务完成才被带出去（用户表现为「早完成了却没有
-        任何消息」）。现在改成：flush 期间循环取走新到达的，收尾再检查一次残留。
-        """
+        """发布缓冲通告；失败时按原顺序回队列并退避重试，绝不静默丢结果。"""
         if sid in self._flushing:
-            return                          # 已有 flush 在处理这个会话
+            return
         self._flushing.add(sid)
+        retry = False
         try:
             for _ in range(6):
                 tasks = self._notice_buffer.pop(sid, []) or []
@@ -1225,14 +1368,19 @@ class VideoComprehensionPlugin(BasePlugin):
                 try:
                     await self.ctx.publish_notice(sid, MessageChain([Text(text)]),
                                                   is_mentioned=True)
+                    self._notice_retries.pop(sid, None)
                     logger.info("[VC] 已回灌分析完成通告（%d 条任务）→ %s", len(tasks), sid)
                 except Exception:
-                    logger.exception("[VC] 回灌分析通告失败")
-                    return
+                    # 新到的任务排在后面，当前这批必须留在最前面，避免乱序。
+                    self._notice_buffer[sid] = tasks + self._notice_buffer.get(sid, [])
+                    retry = True
+                    logger.exception("[VC] 回灌分析通告失败（结果已保留，将退避重试）")
+                    break  # return 会跳过 finally 后的重试调度
         finally:
             self._flushing.discard(sid)
-        # 极端情况下（持续有新任务）还留了残留 → 再排一次，保证不丢
-        if self._notice_buffer.get(sid):
+        if retry:
+            self._schedule_notice_retry(sid)
+        elif self._notice_buffer.get(sid):
             self._ensure_flush_task(sid)
 
     def _compose_notice(self, tasks: list) -> str:
@@ -1553,9 +1701,11 @@ class VideoComprehensionPlugin(BasePlugin):
             try:
                 for ele in self._iter_videos(getattr(m, "chain", None)):
                     f = str(getattr(ele, "file", "") or "")
+                    nm = str(getattr(ele, "name", "") or "")
                     if f.startswith(("http://", "https://")):
-                        nm = str(getattr(ele, "name", "") or "")
                         self._spawn(self._cache_then_transcribe(sid, f, nm), name="vc_cache")
+                    elif os.path.isfile(f):
+                        self._remember_cached(sid, os.path.basename(f), f, f)
             except Exception:
                 continue
 
@@ -1684,7 +1834,7 @@ class VideoComprehensionPlugin(BasePlugin):
             return
         hint = ""
         if cached_list:
-            # 已缓存 → 在 system prompt 里给「怎么用」的提示（路径已在消息里）
+            # 已缓存 → 给「怎么用」的提示；放在当前 user 尾部，避免改变系统缓存前缀。
             first = cached_list[-1]
             hint = (f"\n【视频】已缓存的视频用 analyze_video(local_path=\"{first.get('rel','')}\") "
                     f"分析内容（画面 + 语音转写一起）")
@@ -1694,12 +1844,12 @@ class VideoComprehensionPlugin(BasePlugin):
                 hint = "\n【B站视频】analyze_video / send_video / search_bili_video"
             else:
                 hint = "\n【视频】analyze_video 分析内容"
-        if hint:
-            for p in req.system_prompt:
-                if p.name and "tool" in p.name.lower():
-                    p.content += hint; break
-            else:
-                if req.system_prompt: req.system_prompt[-1].content += hint
+        if hint and not any(getattr(p, "name", "") == "video_comprehension"
+                            for p in req.user_prompt):
+            # 动态路径不能写进 system_prompt：否则每来一个新视频都会使系统
+            # 前缀与其后的历史缓存失效。persist=False 保证提示也不污染历史。
+            req.user_prompt.append(Prompt(
+                hint, name="video_comprehension", source="system", persist=False))
 
     # ── 视频检测 ──
 
@@ -1756,20 +1906,24 @@ class VideoComprehensionPlugin(BasePlugin):
                 continue
         return ids
 
-    def _find_cached(self, safe_name: str) -> str:
-        """在缓存目录里找同一个原始文件名已缓存过的文件（避免同一视频反复下载）"""
+    @staticmethod
+    def _cache_identity(source_url: str) -> str:
+        # 只保存哈希，不把可能带签名参数的 URL 写进文件名。
+        return hashlib.sha256(str(source_url).encode("utf-8")).hexdigest()[:16]
+
+    def _find_cached(self, safe_name: str, source_url: str = "") -> str:
+        """只按来源身份复用，绝不因文件名相同就错配不同视频。"""
+        if not source_url:
+            return ""
+        p = os.path.join(self.other_cache_dir, f"v{self._cache_identity(source_url)}_{safe_name}")
         try:
-            suffix = "_" + safe_name
-            for fn in os.listdir(self.other_cache_dir):
-                if fn.endswith(suffix) or fn == safe_name:
-                    p = os.path.join(self.other_cache_dir, fn)
-                    if os.path.isfile(p) and os.path.getsize(p) > 0:
-                        return p
-        except Exception:
+            if os.path.isfile(p) and os.path.getsize(p) > 0:
+                return p
+        except OSError:
             pass
         return ""
 
-    def _remember_cached(self, sid: str, safe_name: str, path: str):
+    def _remember_cached(self, sid: str, safe_name: str, path: str, source_url: str = ""):
         """登记到该会话的已缓存列表（列表结构，支持一条消息里多个视频）"""
         try:
             rel = os.path.relpath(path, get_data_path()).replace("\\", "/")
@@ -1779,13 +1933,21 @@ class VideoComprehensionPlugin(BasePlugin):
             size_mb = os.path.getsize(path) / (1024 * 1024)
         except Exception:
             size_mb = 0.0
+        failures = self._video_failures.get(sid)
+        if failures is not None:
+            failures.pop(safe_name, None)
+            if not failures:
+                self._video_failures.pop(sid, None)
+                self._video_failure_times.pop(sid, None)
         lst = self._cached_videos.setdefault(sid, [])
         for c in lst:
             if c.get("path") == path:
                 c["ts"] = time.time()
+                if source_url:
+                    c["source_url"] = source_url
                 return
         lst.append({"orig_name": safe_name, "path": path, "rel": rel,
-                    "size_mb": size_mb, "ts": time.time()})
+                    "size_mb": size_mb, "ts": time.time(), "source_url": source_url})
 
     @staticmethod
     def _explain_failure(e: Exception) -> str:
@@ -1805,27 +1967,28 @@ class VideoComprehensionPlugin(BasePlugin):
             safe = re.sub(r"[^\w.\-]+", "_", (name or "").strip()) or "video.mp4"
             if not re.search(r"\.(mp4|mov|mkv|webm|avi|flv|m4v|ts|wmv)$", safe, re.I):
                 safe += ".mp4"
-            # 已有同名缓存 → 直接复用（同一视频常被反复引用，不必重复下载/转写）
-            existing = self._find_cached(safe)
-            if existing:
-                self._remember_cached(sid, safe, existing)
-                logger.info("[VC] 视频已在缓存中，复用: %s", os.path.basename(existing))
-                return existing
-            path = os.path.join(self.other_cache_dir, f"v{int(time.time())}_{safe}")
-            max_bytes = int(self.cache_max_file_mb * 1024 * 1024) if self.cache_max_file_mb > 0 else 0
-            if not (os.path.exists(path) and os.path.getsize(path) > 0):
+            identity = self._cache_identity(url)
+            async with self._session_lock(f"incoming:{identity}"):
+                existing = self._find_cached(safe, url)
+                if existing:
+                    self._remember_cached(sid, safe, existing, url)
+                    logger.info("[VC] 视频已在缓存中，按来源复用: %s", os.path.basename(existing))
+                    return existing
+                path = os.path.join(self.other_cache_dir, f"v{identity}_{safe}")
+                max_bytes = int(self.cache_max_file_mb * 1024 * 1024) if self.cache_max_file_mb > 0 else 0
                 try:
                     await download_video(url, path, timeout=self.dl_timeout, max_bytes=max_bytes)
                 except Exception as de:
                     self._video_failures.setdefault(sid, {})[safe] = self._explain_failure(de)
+                    self._video_failure_times[sid] = time.time()
                     raise
-            if os.path.exists(path) and os.path.getsize(path) > 0:
-                self._remember_cached(sid, safe, path)
-                logger.info("[VC] 视频已缓存(%d): %s (%.2fMB)",
-                            len(self._cached_videos.get(sid) or []), os.path.basename(path),
-                            os.path.getsize(path) / (1024 * 1024))
-                return path
-            logger.warning("[VC] 视频缓存后文件为空: %s", url)
+                if os.path.exists(path) and os.path.getsize(path) > 0:
+                    self._remember_cached(sid, safe, path, url)
+                    logger.info("[VC] 视频已缓存(%d): %s (%.2fMB)",
+                                len(self._cached_videos.get(sid) or []), os.path.basename(path),
+                                os.path.getsize(path) / (1024 * 1024))
+                    return path
+                logger.warning("[VC] 视频缓存后文件为空: %s", url)
         except Exception as e:
             logger.warning("[VC] 视频缓存失败: %s", e)
         return ""
@@ -1847,7 +2010,15 @@ class VideoComprehensionPlugin(BasePlugin):
         async with self._bg_gate():
             path = await self._cache_incoming_video(sid, url, name)
             if path:
-                self._start_transcript_task(path, skip_asr=not self._any_group_needs_stt())
+                task = self._start_transcript_task(
+                    path, skip_asr=not self._any_group_needs_stt())
+                if task is not None:
+                    try:
+                        # 闸必须覆盖转写生命周期，而不是创建 Task 后就释放。
+                        # shield 防止重复缓存请求的取消误伤共享的同一转写任务。
+                        await asyncio.shield(task)
+                    except Exception as e:
+                        logger.debug("[VC] 后台转写结束（已降级不影响分析）: %s", e)
 
     def _bg_gate(self):
         """后台重活的统一并发闸（缓存 / 转写）。
@@ -1872,10 +2043,32 @@ class VideoComprehensionPlugin(BasePlugin):
     def _transcript_key(self, video_path: str) -> str:
         try:
             st = os.stat(video_path)
+            raw = f"{os.path.abspath(video_path)}:{st.st_size}:{st.st_mtime_ns}"
+        except Exception:
+            raw = str(video_path)
+        return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    def _legacy_transcript_key(self, video_path: str) -> str:
+        """1.18.0 初版使用的秒级键，仅用于读取并迁移旧缓存。"""
+        try:
+            st = os.stat(video_path)
             raw = f"{os.path.abspath(video_path)}:{st.st_size}:{int(st.st_mtime)}"
         except Exception:
             raw = str(video_path)
         return hashlib.md5(raw.encode()).hexdigest()[:16]
+
+    def _load_video_transcript(self, video_path: str, key: str):
+        """优先纳秒键；兼容旧秒级缓存，命中后迁移而非重跑 ASR。"""
+        data = self._load_transcript(key)
+        if data:
+            return data
+        legacy = self._legacy_transcript_key(video_path)
+        if legacy == key:
+            return None
+        data = self._load_transcript(legacy)
+        if data:
+            self._save_transcript(key, data)
+        return data
 
     def _transcript_path(self, key: str) -> str:
         d = os.path.join(self.other_cache_dir, ".transcripts")
@@ -1945,7 +2138,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.audio_enabled or (not want_sub and not self._asr_ready()):
             return {}
         key = self._transcript_key(video_path)
-        cached = self._load_transcript(key)
+        cached = self._load_video_transcript(video_path, key)
         if cached:
             return cached
         t0 = time.time()
@@ -2021,23 +2214,27 @@ class VideoComprehensionPlugin(BasePlugin):
             logger.warning("[VC] 语音转写失败（不影响视频分析）: %s", e)
         except Exception as e:
             logger.warning("[VC] 语音转写异常（不影响视频分析）: %s", e)
+        finally:
+            # audio.wav / blk_*.wav 只是中间产物；持久结果是 .transcripts/<key>.json。
+            # 成功、失败、跳过、取消都尝试清理，Windows 占用导致的残留再由缓存扫描兜底。
+            await asyncio.to_thread(shutil.rmtree, work, ignore_errors=True)
         return {}
 
     def _start_transcript_task(self, video_path: str, bvid: str = "", cid: int = 0,
-                               skip_asr: bool = False):
-        """后台启动转写（与视频缓存并行，拿到就缓存好，分析时零等待）"""
+                               skip_asr: bool = False) -> Optional[asyncio.Task]:
+        """返回新建或进行中的转写任务；无需转写/已有持久缓存时返回 None。"""
         want_sub = bool(self.bili_use_subtitle and bvid and cid)
         if not self.audio_enabled or (not want_sub and not self._asr_ready()):
-            return
+            return None
         if skip_asr and not want_sub:
-            return
+            return None
         if not video_path or not os.path.isfile(video_path):
-            return
+            return None
         key = self._transcript_key(video_path)
         if key in self._asr_tasks and not self._asr_tasks[key].done():
-            return
-        if self._load_transcript(key):
-            return
+            return self._asr_tasks[key]
+        if self._load_video_transcript(video_path, key):
+            return None
         task = asyncio.create_task(self._build_transcript(video_path, bvid=bvid, cid=cid,
                                                           skip_asr=skip_asr))
         self._asr_tasks[key] = task
@@ -2046,6 +2243,7 @@ class VideoComprehensionPlugin(BasePlugin):
             if self._asr_tasks.get(k) is _t:
                 self._asr_tasks.pop(k, None)
         task.add_done_callback(_cleanup)
+        return task
 
     async def _get_transcript(self, video_path: str, wait: float,
                               bvid: str = "", cid: int = 0,
@@ -2057,7 +2255,7 @@ class VideoComprehensionPlugin(BasePlugin):
         if not video_path or not os.path.isfile(video_path):
             return {}
         key = self._transcript_key(video_path)
-        cached = self._load_transcript(key)
+        cached = self._load_video_transcript(video_path, key)
         if cached:
             return cached
         task = self._asr_tasks.get(key)
@@ -2089,6 +2287,7 @@ class VideoComprehensionPlugin(BasePlugin):
         chain_top = getattr(event.message, "chain", None)
         saw_video_ele = False      # 链里出现过 Video（即便 file 为空）
         has_video_seg = False      # raw_message 里有 video 段
+        raw_videos = []            # raw/get_msg 里的全部视频 (url, name)
 
         # 1) 消息链里的 Video 元素（含引用 chain / 合并转发 chains）
         try:
@@ -2122,8 +2321,13 @@ class VideoComprehensionPlugin(BasePlugin):
                 for s in segs:
                     if isinstance(s, dict) and s.get("type") == "video":
                         has_video_seg = True
-                        url = (s.get("data") or {}).get("url") or ""
-                        break
+                        data = s.get("data") or {}
+                        u = data.get("url") or ""
+                        if u:
+                            raw_videos.append((str(u), str(data.get("name") or "")))
+                        if not url:
+                            url = u
+                            vname = str(data.get("name") or "")
 
         # 3) 兜底：主动调 OneBot 接口拉（当前消息 → 引用消息）
         #    只在「确实有视频迹象」时才调，避免每条纯文字消息都白跑一次 API
@@ -2134,30 +2338,40 @@ class VideoComprehensionPlugin(BasePlugin):
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
                 cl = ad.get_client()
 
-                async def _scan_get_msg(mid) -> str:
-                    """取一条消息，返回其中的视频 URL"""
+                async def _scan_get_msg(mid) -> list:
+                    """取一条消息里的全部视频 (url, name)。"""
                     if not mid:
-                        return ""
+                        return []
                     rm = await cl.send_action("get_msg", {"id": mid}, timeout=15)
+                    found = []
                     if isinstance(rm, dict):
                         for s in (rm.get("message") or []):
                             if isinstance(s, dict) and s.get("type") == "video":
-                                return (s.get("data") or {}).get("url", "") or ""
-                    return ""
+                                data = s.get("data") or {}
+                                u = data.get("url") or ""
+                                if u:
+                                    found.append((str(u), str(data.get("name") or "")))
+                    return found
 
                 # 3a) 当前消息
                 mid = getattr(event.message, "message_id", None) or getattr(event, "message_id", None)
                 try:
-                    url = await _scan_get_msg(mid)
+                    found = await _scan_get_msg(mid)
+                    raw_videos.extend(found)
+                    if found:
+                        url, vname = found[0]
                 except Exception:
-                    url = ""
+                    pass
                 # 3b) 引用消息（适配器若没解析出内层链，这里按被引用消息 ID 主动拉）
                 if not url:
                     for rid in reply_ids:
                         try:
-                            url = await _scan_get_msg(rid)
+                            found = await _scan_get_msg(rid)
+                            raw_videos.extend(found)
+                            if found:
+                                url, vname = found[0]
                         except Exception:
-                            url = ""
+                            pass
                         if url:
                             logger.info("[VC] 通过引用消息 ID 主动拉到视频: %s", rid)
                             break
@@ -2171,11 +2385,28 @@ class VideoComprehensionPlugin(BasePlugin):
             #   mentioned → 只在被 @ / 引用 / 唤醒时才缓存（默认，最省）
             # 注意：URL 始终记录在 _pending，所以 bot 主动调工具时永远有源可用。
             if self.auto_cache_video:
-                if str(url).startswith(("http://", "https://")):
-                    if self.cache_scope == "all":
-                        self._spawn(self._cache_then_transcribe(sid, url, vname), name="vc_cache")
+                if self.cache_scope == "all":
+                    candidates = []
+                    try:
+                        for ele in self._iter_videos(chain_top):
+                            f = str(getattr(ele, "file", "") or "")
+                            if f:
+                                candidates.append((f, str(getattr(ele, "name", "") or "")))
+                    except Exception:
+                        pass
+                    candidates.extend(raw_videos)
+                    candidates.append((str(url), vname))
+                    seen = set()
+                    for u, n in candidates:
+                        if not u or u in seen:
+                            continue
+                        seen.add(u)
+                        if u.startswith(("http://", "https://")):
+                            self._spawn(self._cache_then_transcribe(sid, u, n), name="vc_cache")
+                        elif os.path.isfile(u):
+                            self._remember_cached(sid, os.path.basename(u), u, u)
                 elif os.path.isfile(url):
-                    self._remember_cached(sid, os.path.basename(url), url)
+                    self._remember_cached(sid, os.path.basename(url), url, url)
 
     # ────────────── 工具1：search_bili_video ──────────────
 
@@ -2231,12 +2462,18 @@ class VideoComprehensionPlugin(BasePlugin):
             q = quality or self.send_video_quality
             # 压缩
             os.makedirs(self.other_cache_dir, exist_ok=True)
-            out_path = os.path.join(self.other_cache_dir, f"send_local_{Path(lp).stem}.mp4")
+            out_path = lp if q == "original" else self._compression_cache_path(
+                self.other_cache_dir, "send_local", lp, 360 if q == "low" else 720,
+                32 if q == "low" else 28)
             try:
-                if q == "low": await compress_video(lp, out_path, max_width=360, crf=32)
-                elif q == "medium": await compress_video(lp, out_path, max_width=720, crf=28)
-                elif q == "original": out_path = lp
-                else: await compress_video(lp, out_path, max_width=720, crf=28)
+                if q == "low":
+                    out_path = await self._compress_cached(lp, out_path, max_width=360, crf=32)
+                elif q == "medium":
+                    out_path = await self._compress_cached(lp, out_path, max_width=720, crf=28)
+                elif q == "original":
+                    out_path = lp
+                else:
+                    out_path = await self._compress_cached(lp, out_path, max_width=720, crf=28)
             except Exception as e:
                 logger.warning("[VC] 本地视频压缩失败，改发原文件: %s", e)
                 out_path = lp
@@ -2315,19 +2552,22 @@ class VideoComprehensionPlugin(BasePlugin):
         os.makedirs(self.bili_cache_dir, exist_ok=True)
         q = quality or self.bili_download_quality
         try:
-            path, _ = await download_bili_video(bvid, self.bili_cache_dir, info=info,
-                cookie=self.bili_cookie, timeout=self.dl_timeout, max_seconds=self.bili_max_dl,
-                quality=q)
+            # 发送、自动发送与分析必须共用同一把 BV 锁，避免并发写同一缓存。
+            async with self._session_lock(f"bili:{bvid}"):
+                path, _ = await download_bili_video(bvid, self.bili_cache_dir, info=info,
+                    cookie=self.bili_cookie, timeout=self.dl_timeout, max_seconds=self.bili_max_dl,
+                    quality=q)
         except Exception as e: return f"⚠️ 下载失败：{e}"
         # 下载后是否再压缩：只在 compress_quality 比下载质量更低时才有意义
         _rank = {"low": 1, "medium": 2, "original": 3}
         cq = self.bili_compress_quality
         if cq and cq != "original" and _rank.get(cq, 3) < _rank.get(q, 3):
             try:
-                compressed = os.path.join(self.bili_cache_dir, f"send_{bvid}_compressed.mp4")
-                if cq == "low": await compress_video(path, compressed, max_width=360, crf=32)
-                elif cq == "medium": await compress_video(path, compressed, max_width=720, crf=28)
-                out_path = compressed
+                width, crf = (360, 32) if cq == "low" else (720, 28)
+                compressed = self._compression_cache_path(
+                    self.bili_cache_dir, f"send_{bvid}", path, width, crf)
+                out_path = await self._compress_cached(path, compressed,
+                                                       max_width=width, crf=crf)
             except Exception as e:
                 logger.warning("[VC] B站视频压缩失败，改发原文件: %s", e)
                 out_path = path
@@ -2358,22 +2598,19 @@ class VideoComprehensionPlugin(BasePlugin):
                     chunk_size = 512 * 1024
                     total_chunks = max(1, math.ceil(file_size / chunk_size))
                     stream_id = uuid.uuid4().hex
-                    digest = hashlib.sha256()
-                    with open(out_path, "rb") as f:
-                        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-                            digest.update(chunk)
-                    sha256 = digest.hexdigest()
+                    sha256 = await asyncio.to_thread(_file_sha256, out_path)
                     retention = 600000
                     with open(out_path, "rb") as f:
                         for ci in range(total_chunks):
-                            chunk = f.read(chunk_size)
+                            chunk = await asyncio.to_thread(f.read, chunk_size)
                             if not chunk: break
+                            encoded = await asyncio.to_thread(_b64_chunk, chunk)
                             _raise_for_stream(await cl.send_action("upload_file_stream", {
                                 "stream_id": stream_id, "chunk_index": ci,
                                 "total_chunks": total_chunks, "file_size": file_size,
                                 "filename": filename, "expected_sha256": sha256,
                                 "file_retention": retention,
-                                "chunk_data": base64.b64encode(chunk).decode("ascii"),
+                                "chunk_data": encoded,
                             }, timeout=120))
                     resp = await cl.send_action("upload_file_stream", {
                         "stream_id": stream_id, "is_complete": True,
@@ -2689,7 +2926,16 @@ class VideoComprehensionPlugin(BasePlugin):
             dup_key="")
         # 同步模式下不让它触发「完成通告」，避免与工具返回重复
         task.notified = True
-        state, payload = await self._await_or_handoff(task, self.analysis_budget_sec)
+        try:
+            state, payload = await self._await_or_handoff(task, self.analysis_budget_sec)
+        except asyncio.CancelledError:
+            # 外层框架取消的是工具协程，不是后台任务。必须恢复通告，
+            # 否则后台虽已完成，结果却永远没有交付入口。
+            task.notified = False
+            if task.state in ("done", "failed", "rejected", "cancelled"):
+                self._spawn(self._notify_done(task),
+                            name=f"vc_notice_recovery_{task.task_id}")
+            raise
         if state == "handoff":
             # 超预算 / 被框架取消 → 已转后台，恢复通告（结果仍要交回）
             task.notified = False
@@ -2715,6 +2961,7 @@ class VideoComprehensionPlugin(BasePlugin):
         task.progress = "正在解析视频来源"
         if kind == "followup":
             task.progress = "正在回答追问"
+            task.session_id = sess.session_id if sess else ""
             return await self._followup(sess, question, model_spec)
         if kind == "segment":
             task.progress = "正在按时间段抽帧分析"
@@ -2774,20 +3021,20 @@ class VideoComprehensionPlugin(BasePlugin):
         """
         try:
             if source_type != "bilibili" and source_url.startswith(("http://", "https://")):
-                # 自动缓存过的文件（按原始文件名后缀匹配）
-                name = os.path.basename(source_url.split("?")[0]) or ""
-                if name:
-                    hit = self._find_cached(name)
-                    if hit:
-                        logger.info("[VC] 复用已缓存的视频: %s", os.path.basename(hit))
-                        return hit, "local", bvid
-                # 会话最近的缓存里找（同一个视频被反复引用时最有效）
+                # 只按完整来源身份复用；文件名仅用于展示，不能作为视频身份。
                 for c in (self._cached_videos.get(sid) or [])[::-1]:
                     p = c.get("path") or ""
-                    if p and os.path.isfile(p) and c.get("orig_name") and \
-                            c["orig_name"] in source_url:
+                    if c.get("source_url") == source_url and p and os.path.isfile(p):
                         logger.info("[VC] 复用会话缓存的视频: %s", os.path.basename(p))
                         return p, "local", bvid
+                name = os.path.basename(source_url.split("?")[0]) or "video.mp4"
+                safe = re.sub(r"[^\w.\-]+", "_", name.strip()) or "video.mp4"
+                if not re.search(r"\.(mp4|mov|mkv|webm|avi|flv|m4v|ts|wmv)$", safe, re.I):
+                    safe += ".mp4"
+                hit = self._find_cached(safe, source_url)
+                if hit:
+                    logger.info("[VC] 复用已缓存的视频: %s", os.path.basename(hit))
+                    return hit, "local", bvid
         except Exception as e:
             logger.debug("[VC] 本地复用检查失败: %s", e)
         return source_url, source_type, bvid
@@ -2863,6 +3110,8 @@ class VideoComprehensionPlugin(BasePlugin):
                         raw.append((float(s), float(e)))
                     except Exception:
                         continue
+            if not raw:
+                return None, "segments 已传入但无法解析；请使用 [[起秒,止秒],...] 或 10-30,100-130"
         elif start_sec or end_sec:
             try:
                 raw.append((float(start_sec or 0), float(end_sec or 0)))
@@ -2937,7 +3186,8 @@ class VideoComprehensionPlugin(BasePlugin):
 
     async def _vision(self, sess_id, sid, stype, surl, bvid, question,
                       segments=None, model_spec=None):
-        if not self._profiles: return "未配置模型"
+        if not self._profiles:
+            raise VideoAnalysisError("未配置模型")
 
         # 选模型用的时长：指定片段时用片段总长，否则用视频真实时长
         duration_hint = self.max_duration
@@ -2957,7 +3207,8 @@ class VideoComprehensionPlugin(BasePlugin):
             except Exception:
                 pass
         profile = model_spec or select_model(self._profiles, duration_hint, self.default_model)
-        if not profile: return "无合适模型"
+        if not profile:
+            raise VideoAnalysisError("无合适模型")
 
         # N5：work 目录带会话+随机后缀，避免同会话并发任务（或同一视频被重复分析）
         #     写同一个目录互相踩（原来只用 sess_id 命名）
@@ -2973,7 +3224,8 @@ class VideoComprehensionPlugin(BasePlugin):
                     raw_path, info = await download_bili_video(bvid, self.bili_cache_dir, cookie=self.bili_cookie,
                         timeout=self.dl_timeout, max_seconds=self.max_duration,
                         quality=self.bili_download_quality)
-            except Exception as e: return f"⚠️ 下载失败：{e}"
+            except Exception as e:
+                raise VideoAnalysisError(f"下载失败：{e}") from e
             # 分析工作也放 bili_cache_dir
             work = os.path.join(self.bili_cache_dir, f"analysis_{sess_id}_{_wsuf}")
         else:
@@ -3000,8 +3252,9 @@ class VideoComprehensionPlugin(BasePlugin):
             skip_compress=bool(segments),
             skip_compress_if_under_mb=under_mb)
         if result["status"] == "rejected":
-            return self._reject_hint(result)
-        if result["status"] == "error": return f"⚠️ 处理失败：{result['error']}"
+            raise VideoAnalysisError(self._reject_hint(result))
+        if result["status"] == "error":
+            raise VideoAnalysisError(f"处理失败：{result['error']}")
 
         sess = VideoSession(sess_id, sid, stype, surl) if sess_id not in self._sessions else self._sessions[sess_id]
         sess.compressed_path = result.get("compressed_path", "")
@@ -3010,7 +3263,6 @@ class VideoComprehensionPlugin(BasePlugin):
         sess.scene_count = result.get("scene_count", 0); sess.total_frames = result.get("total_frames", 0)
         sess.timestamps = result.get("timestamps", [])
         sess.file_size_mb = result.get("file_size_mb", 0); sess.compressed_size_mb = result.get("compressed_size_mb", 0)
-        self._register_session(sess, sid)
 
         real_segs = [(s, e) for s, e in (result.get("segments") or [])]
         # 取转写/字幕（最多等 audio_wait_sec 秒；超时就不带，绝不卡住分析）
@@ -3024,7 +3276,8 @@ class VideoComprehensionPlugin(BasePlugin):
         # M5：指定时间段分析时，只带该段字幕（原先会把整片字幕塞进提示词，
         #     既费 token 又容易让模型答非所问）
         if real_segs:
-            tdoc = self._clip_transcript(tr, real_segs) or tdoc
+            # 段内没有字幕就是“没有”，不能用 or 回退成整片字幕。
+            tdoc = self._clip_transcript(tr, real_segs)
         analysis, label, downgrade_note, host_url = await self._analyze_result(
             profile, result, real_segs, question, work, transcript_doc=tdoc,
             bili_bvid=bvid if stype == "bilibili" else "",
@@ -3035,6 +3288,8 @@ class VideoComprehensionPlugin(BasePlugin):
             sess.host_url = host_url
         if tdoc:
             sess.transcript_doc = tdoc
+        # 只有真正拿到分析结果才登记新会话，失败不能留下“已有分析”的空壳。
+        self._register_session(sess, sid)
 
         range_line = self._range_line(real_segs, result.get("duration", 0))
         link_line = self._link_line(host_url)
@@ -3103,15 +3358,35 @@ class VideoComprehensionPlugin(BasePlugin):
         doc = tr.get("doc", "") or ""
         if not doc or not segs:
             return doc
-        s0 = min(float(s) for s, e in segs)
-        e0 = max(float(e) for s, e in segs)
+        ranges = [(float(s), float(e)) for s, e in segs if float(e) > float(s)]
+
+        def _overlaps(start, end):
+            return any(end > s and start < e for s, e in ranges)
+
+        # 每个转写段最多出现一次，但必须只与“某一个目标段”重叠；
+        # 不能用 min(start) ~ max(end) 把多段之间的内容也包进来。
         subs = [g for g in (tr.get("segments") or [])
-                if float(g.get("end") or 0) > s0 and float(g.get("start") or 0) < e0]
-        speech = [r for r in (tr.get("speech") or [])
-                  if len(r) >= 2 and float(r[1]) > s0 and float(r[0]) < e0]
-        if not subs and not speech:
+                if _overlaps(float(g.get("start") or 0), float(g.get("end") or 0))]
+        speech = []
+        for r in (tr.get("speech") or []):
+            if len(r) < 2:
+                continue
+            for s, e in ranges:
+                start, end = max(float(r[0]), s), min(float(r[1]), e)
+                if end - start >= 0.05:
+                    speech.append((start, end))
+        speech.sort()
+        merged = []
+        for start, end in speech:
+            if merged and start <= merged[-1][1] + 0.01:
+                merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+            else:
+                merged.append((start, end))
+        if not subs and not merged:
             return ""
-        return build_timeline_doc(subs, speech, float(tr.get("total") or 0))
+        header = doc.splitlines()[0] if doc.splitlines() else None
+        total = sum(max(0.0, e - s) for s, e in ranges)
+        return build_timeline_doc(subs, merged, total, header=header)
 
     def _range_line(self, segs, duration: float) -> str:
         """结果头部的分析范围标注"""
@@ -3167,15 +3442,20 @@ class VideoComprehensionPlugin(BasePlugin):
                     logger.info("[VC] 文件 %.1fMB 超过上传上限 %dMB，改用 base64",
                                 size_mb, self.upload_max_mb)
                     return None
-                key = f"{path}:{os.path.getmtime(path):.0f}"
+                st = os.stat(path)
+                key = f"{path}:{st.st_size}:{st.st_mtime_ns}"
                 if key in self._upload_cache:
-                    return self._upload_cache[key]
+                    url = self._upload_cache.pop(key)
+                    self._upload_cache[key] = url  # LRU：命中后移到最新位置
+                    return url
                 t0 = time.time()
                 url, used_host = await upload_to_any(path, self.upload_hosts,
                                                      timeout=self.upload_timeout,
                                                      keep_name=self.upload_keep_name,
                                                      use_proxy=self.upload_use_proxy)
                 self._upload_cache[key] = url
+                while len(self._upload_cache) > 128:
+                    self._upload_cache.pop(next(iter(self._upload_cache)))
                 logger.info("[VC] 视频已上传（%.1fMB, %.1fs, %s）→ %s",
                             size_mb, time.time() - t0, used_host, url)
                 return url
@@ -3239,7 +3519,8 @@ class VideoComprehensionPlugin(BasePlugin):
             except Exception as e:
                 logger.warning("[VC] native 模式失败，降级帧模式: %s", e)
                 if not result.get("grids_base64"):
-                    return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (native)", "", None
+                    raise VideoAnalysisError(
+                        f"AI分析失败（native: {type(e).__name__}: {e}）") from e
                 try:
                     analysis = await analyze_frames(profile, result["grids_base64"], meta,
                                                     question, ask_prompt)
@@ -3247,10 +3528,12 @@ class VideoComprehensionPlugin(BasePlugin):
                             f"\n（原生视频模式失败，已降级为帧模式：{str(e)[:120]}）", None)
                 except Exception as e2:
                     logger.error("[VC] LLM失败: %s", e2)
-                    return (f"⚠️ AI分析失败（native: {type(e).__name__} / frames: {type(e2).__name__}）",
-                            f"{profile.name} (native)", "", None)
+                    raise VideoAnalysisError(
+                        f"AI分析失败（native: {type(e).__name__} / frames: {type(e2).__name__}）") from e2
 
         # frames 路径（含 native 多段：一次请求覆盖所有段）
+        if not result.get("grids_base64"):
+            raise VideoAnalysisError("未能提取有效视频画面，无法进行帧分析")
         try:
             analysis = await analyze_frames(profile, result["grids_base64"], meta,
                                             question, ask_prompt)
@@ -3259,15 +3542,15 @@ class VideoComprehensionPlugin(BasePlugin):
             return analysis, label, note, None
         except Exception as e:
             logger.error("[VC] LLM失败: %s", e)
-            return f"⚠️ AI分析失败（{type(e).__name__}）", f"{profile.name} (frames)", "", None
+            raise VideoAnalysisError(f"AI分析失败（frames: {type(e).__name__}: {e}）") from e
 
     async def _segment_analyze(self, sess, question, segs, model_spec=None):
         """对已有 session 的视频做指定时间段分析（用本地文件，不重新下载）"""
         path = sess.compressed_path
         if not path or not os.path.isfile(path):
-            return ("⚠️ 本地视频文件已失效（可能被缓存清理），请重新发送或重新分析该视频")
+            raise VideoAnalysisError("本地视频文件已失效（可能被缓存清理），请重新发送或重新分析该视频")
         if not self._profiles:
-            return "未配置模型"
+            raise VideoAnalysisError("未配置模型")
 
         # 按视频实际时长截断
         real = []
@@ -3276,7 +3559,7 @@ class VideoComprehensionPlugin(BasePlugin):
             if e2 - s >= 0.05:
                 real.append((s, e2))
         if not real:
-            return (f"⚠️ 时间段超出视频时长（视频共 {sess.duration:.1f}s）")
+            raise VideoAnalysisError(f"时间段超出视频时长（视频共 {sess.duration:.1f}s）")
         total = sum(e - s for s, e in real)
         spec = model_spec or sess.model_tag               # 同样沿用会话的模型
         profile = (self._find_profile(spec) if spec else None) \
@@ -3301,7 +3584,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 cell_width=self.cell_width, cell_ratio=self.cell_ratio,
                 segments=[[s, e] for s, e in real], skip_compress=True)
         if result["status"] != "ok":
-            return f"⚠️ 处理失败：{result.get('error', result['status'])}"
+            raise VideoAnalysisError(f"处理失败：{result.get('error', result['status'])}")
 
         # 转写：优先用缓存/进行中的任务，超时就不带（不卡住）
         tr = await self._get_transcript(path, self.audio_wait_sec,
@@ -3330,7 +3613,8 @@ class VideoComprehensionPlugin(BasePlugin):
         profile = (self._find_profile(spec) if spec else None) \
             or select_model(self._profiles, sess.duration, self.default_model) \
             or (self._profiles[0] if self._profiles else None)
-        if not profile: return "无可用模型"
+        if not profile:
+            raise VideoAnalysisError("无可用模型")
         if model_spec:                                   # 本次显式换了模型 → 更新会话
             sess.model_tag = profile.label or str(profile.group)
 
@@ -3338,8 +3622,7 @@ class VideoComprehensionPlugin(BasePlugin):
         #     而不是直接拒绝（原先会回「只有xx结果，深度分析后可追问画面」）。
         if not sess.grids_base64:
             if not (sess.analysis or sess.transcript_doc):
-                return ("⚠️ 该会话的可用资料已过期（拼图与分析都被清理），"
-                        "请重新发送视频或重新分析")
+                raise VideoAnalysisError("该会话的可用资料已过期（拼图与分析都被清理），请重新发送视频或重新分析")
             meta = f"【视频文字资料】已有分析结论与语音转写（画面帧已回收，无法再看画面）\n" \
                    f"时长: {sess.duration:.1f}s"
             ctx = (f"之前: {sess.analysis[:1500]}\n\n"
@@ -3349,7 +3632,7 @@ class VideoComprehensionPlugin(BasePlugin):
             try:
                 ans = await analyze_frames(profile, [], meta, ctx, "")
             except Exception as e:
-                ans = f"⚠️ 追问失败: {type(e).__name__}: {e}"
+                raise VideoAnalysisError(f"追问失败: {type(e).__name__}: {e}") from e
             sess.add_turn(question, ans)
             return (f"🤖 {profile.name} | session={sess.session_id}\n"
                     f"（提示：该会话的画面帧已被回收，本次基于文字资料作答）\n"
@@ -3361,7 +3644,8 @@ class VideoComprehensionPlugin(BasePlugin):
         try:
             ans = await analyze_frames(profile, sess.grids_base64, meta, ctx,
                                        sess.transcript_doc or "")
-        except Exception as e: ans = f"⚠️ 追问失败: {type(e).__name__}: {e}"
+        except Exception as e:
+            raise VideoAnalysisError(f"追问失败: {type(e).__name__}: {e}") from e
         sess.add_turn(question, ans)
         return (f"🤖 {profile.name} | session={sess.session_id}\n"
                 f"{self._link_line(sess.host_url)}━━━\n{ans}")
@@ -3379,6 +3663,18 @@ def _ts(s: float) -> str:
 
 
 # ── NapCat stream 工具函数（模块级，供类内方法调用） ──────────
+
+def _file_sha256(path: str) -> str:
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _b64_chunk(chunk: bytes) -> str:
+    return base64.b64encode(chunk).decode("ascii")
+
 
 def _raise_for_stream(resp):
     if not isinstance(resp, dict):

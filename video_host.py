@@ -13,7 +13,6 @@
 """
 from __future__ import annotations
 
-import asyncio
 import re
 from pathlib import Path
 
@@ -105,19 +104,18 @@ async def upload_file(path: str, host: str = DEFAULT_HOST, *,
     tmo = httpx.Timeout(connect=20.0, read=timeout, write=timeout, pool=20.0)
     headers = {"User-Agent": UA}
 
-    def _post(use_env_proxy: bool):
+    async def _post(use_env_proxy: bool):
         with open(p, "rb") as fh:
             files = {field: (p.name, fh, guess_mime(str(p)))}
-            with httpx.Client(headers=headers, timeout=tmo, follow_redirects=True,
-                              trust_env=use_env_proxy) as c:
-                return c.post(url, data=form, files=files)
+            async with httpx.AsyncClient(headers=headers, timeout=tmo, follow_redirects=True,
+                                         trust_env=use_env_proxy) as c:
+                return await c.post(url, data=form, files=files)
 
-    loop = asyncio.get_event_loop()
     last_err = None
     # 先按配置直连/走代理；失败再换另一种方式试一次
     for flag in ([use_proxy] if use_proxy else [False, True]):
         try:
-            resp = await loop.run_in_executor(None, _post, flag)
+            resp = await _post(flag)
         except Exception as e:
             last_err = f"{type(e).__name__}: {e}"
             continue
