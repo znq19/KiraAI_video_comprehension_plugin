@@ -85,6 +85,14 @@ async def t_capability():
     check("A1 Telegram 事件声明 video", inst._event_can_video(ev("Telegram")) is True)
     check("A2 Bilibili 事件不支持 video",
           inst._event_can_video(ev("Bilibili", elements=("text", "img"))) is False)
+    ev2x = ev("Telegram")
+    del ev2x.supported_elements
+    ev2x.message_types = ["text", "video"]
+    check("A2b 2.x 回落 message_types", inst._event_can_video(ev2x) is True)
+    ev2x_no = ev("Bilibili")
+    del ev2x_no.supported_elements
+    ev2x_no.message_types = ["text", "img"]
+    check("A2c 2.x 不支持 video", inst._event_can_video(ev2x_no) is False)
     check("A3 3.x 适配器元数据支持 video",
           await inst._adapter_supports_video(Adapter("Telegram", ["text", "video"])) is True)
     check("A4 3.x 适配器元数据不支持 video",

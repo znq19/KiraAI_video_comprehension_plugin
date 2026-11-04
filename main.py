@@ -1046,10 +1046,15 @@ class VideoComprehensionPlugin(BasePlugin):
 
     @staticmethod
     def _event_can_video(event) -> bool:
-        """当前适配器是否声明支持发送 video 元素（Telegram/Discord/微信/WebChat 都支持）。"""
+        """当前适配器是否声明支持发送 video 元素（Telegram/Discord/微信/WebChat 都支持）。
+
+        3.x 用 `supported_elements`；2.x 没有该字段，回落到 `message_types`。
+        """
         try:
-            els = getattr(event, "supported_elements", None) or []
-            return "video" in {str(e).strip().lower() for e in els}
+            els = getattr(event, "supported_elements", None)
+            if els is None:  # 2.x 兼容
+                els = getattr(event, "message_types", None) or []
+            return "video" in {str(e).strip().lower() for e in (els or [])}
         except Exception:
             return False
 
@@ -1773,7 +1778,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 rec = _rec()
                 if rec:
                     rec.update(state="failed", reason="短链解析失败", ts=time.time())
-                self._mark_recent_failed(sid, bvid, rec)
+                self._mark_recent_failed(sid, bvid, {"match_keys": match_keys or (rec or {}).get("match_keys") or []})
                 # 检测时先占的 _pending 必须撤掉，否则 bot 会以为有视频可分析
                 pend = self._pending.get(sid) or {}
                 if pend.get("rid") == rid:
@@ -1791,8 +1796,20 @@ class VideoComprehensionPlugin(BasePlugin):
             if pend.get("rid") == rid:
                 pend["bvid"] = bvid
                 pend["url"] = f"https://www.bilibili.com/video/{bvid}"
+            # 预取标题：让 1.5s 时的标注尽量带上《标题》；限时 8s，失败不影响发送。
+            # 后面 _send_video_by_bvid 直接复用这份 info，不会重复请求。
+            info = None
+            try:
+                info = await get_bili_info(bvid, self.bili_cookie,
+                                           timeout=BILI_INFO_QUICK_TIMEOUT)
+                rec = _rec()
+                if rec and info.get("title"):
+                    rec["title"] = str(info["title"])
+            except Exception:
+                info = None
             logger.info("[VCDIAG] 5/6 后台任务开始 bvid=%s sid=%s", bvid, sid)
-            reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
+            reply = await self._send_video_by_bvid(None, bvid, sid=sid,
+                                                   adapter_name=adapter_name, info=info)
             logger.info("[VCDIAG] 6/6 发送函数返回: %s", str(reply)[:80])
             rec = _rec()
             if reply and reply.startswith("✅"):
@@ -1808,8 +1825,9 @@ class VideoComprehensionPlugin(BasePlugin):
                 # 防重发窗口：LLM 若无视上下文标注又调 send_video，直接拦下
                 _now = time.time()
                 _recs = self._recent_auto.setdefault(sid, {})
-                for _k in [bvid] + list((rec or {}).get("match_keys") or []):
-                    _ku = str(_k).upper()
+                _all_keys = [bvid] + list(match_keys or []) + list((rec or {}).get("match_keys") or [])
+                for _k in dict.fromkeys(str(x) for x in _all_keys if x):
+                    _ku = _k.upper()
                     if _ku and not _ku.startswith("HTTP"):
                         _recs[_ku] = (_now, title, "sent")
             elif reply:
@@ -1818,7 +1836,7 @@ class VideoComprehensionPlugin(BasePlugin):
                 logger.warning("[VC] auto_send 未成功: %s", reply)
                 if rec:
                     rec.update(state="failed", reason=str(reply)[:120], ts=time.time())
-                self._mark_recent_failed(sid, bvid, rec)
+                self._mark_recent_failed(sid, bvid, {"match_keys": match_keys or (rec or {}).get("match_keys") or []})
                 # N4：占位的 _pending 要撤掉，避免 bot 以为有视频可分析
                 pend = self._pending.get(sid) or {}
                 if pend.get("rid") == rid:
@@ -1829,7 +1847,7 @@ class VideoComprehensionPlugin(BasePlugin):
             rec = _rec()
             if rec:
                 rec.update(state="failed", reason=str(e)[:120], ts=time.time())
-            self._mark_recent_failed(sid, bvid, rec)
+            self._mark_recent_failed(sid, bvid, {"match_keys": match_keys or (rec or {}).get("match_keys") or []})
             pend = self._pending.get(sid) or {}
             if pend.get("rid") == rid:
                 self._pending.pop(sid, None)
@@ -1900,17 +1918,6 @@ class VideoComprehensionPlugin(BasePlugin):
         if time.time() - float(sent.get("ts") or 0) > 300:
             self._auto_sent.pop(sid, None)
             return
-        if sent.get("consumed"):
-            # 上一轮已经写过「正在发送」；这里只在最终失败时补一句，
-            # 成功则静默收尾（不重复刷标注，也不多花 token）。
-            if sent.get("state") == "failed":
-                note = self._auto_sent_note(sent)
-                if note and not any(getattr(p, "name", "") == "video_auto_sent"
-                                    for p in req.user_prompt):
-                    req.user_prompt.append(Prompt(note.strip(), name="video_auto_sent",
-                                                  source="system", persist=False))
-            self._auto_sent.pop(sid, None)
-            return
         note = self._auto_sent_note(sent)
         if not note:
             return
@@ -1941,25 +1948,14 @@ class VideoComprehensionPlugin(BasePlugin):
                 hit = any(k in msg_text for k in keys)
             if hit:
                 p.content = (p.content or "") + note
-                if sent.get("state") == "pending":
-                    sent["consumed"] = True      # 先留着，失败时下一轮还能补一句
-                else:
-                    self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉
+                self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉（不依赖下一轮）
                 logger.info("[VC] 已在上下文里标注「已由插件自动下载并发送」: %s",
                             bvid or (keys[0] if keys else "?"))
                 return
 
-        # 原始消息已经不在本轮 batch 里（例如上一条被丢弃后才有的请求）：
-        # 退化成尾部的临时提示。persist=False → 不进历史、不动 system 前缀。
-        if not any(getattr(p, "name", "") == "video_auto_sent" for p in req.user_prompt):
-            req.user_prompt.append(Prompt(note.strip(), name="video_auto_sent",
-                                          source="system", persist=False))
-            logger.info("[VC] 原始链接消息不在本轮批次，改用尾部临时标注: %s",
-                        bvid or (keys[0] if keys else "?"))
-        if sent.get("state") == "pending":
-            sent["consumed"] = True
-        else:
-            self._auto_sent.pop(sid, None)
+        # 原始消息不在本轮 batch（例如它被 discard 了）：**什么都不加**。
+        # 绝不把「某条链接发没发」塞进无关的后续对话；记录直接丢弃。
+        self._auto_sent.pop(sid, None)
 
     # ── 改写消息里的视频占位（让 bot 拿到可用的路径，而不是"没缓存"） ──
 
@@ -2747,7 +2743,8 @@ class VideoComprehensionPlugin(BasePlugin):
         lines.append("\n→ send_video(bvid=BVxxx)")
         return "\n".join(lines)
 
-    async def _send_video_by_bvid(self, event, bvid: str, quality: str = "", sid: str = "", adapter_name: str = "") -> str:
+    async def _send_video_by_bvid(self, event, bvid: str, quality: str = "", sid: str = "",
+                                  adapter_name: str = "", info: dict | None = None) -> str:
         """发送B站视频到当前会话。
 
         - QQ（OneBot）：内置 NapCat 分块上传防断连；
@@ -2770,8 +2767,13 @@ class VideoComprehensionPlugin(BasePlugin):
         if not bvid:
             return ("⚠️ 没有解析出有效的 BV 号。请传 BV 号本身（形如 BV1xx411c7mD），"
                     "或完整的 B站视频链接 / b23.tv 短链。")
-        logger.info("[VCDIAG] c) 开始请求B站视频信息（网络）…")
-        try: info = await get_bili_info(bvid, self.bili_cookie)
+        if info is None:
+            logger.info("[VCDIAG] c) 开始请求B站视频信息（网络）…")
+        else:
+            logger.info("[VCDIAG] c) 使用预取到的视频信息 title=%r", info.get("title"))
+        try:
+            if info is None:
+                info = await get_bili_info(bvid, self.bili_cookie)
         except Exception as e:
             # 把 B站的 code 翻译成人话，方便用户判断是"视频没了"还是"参数不对"
             msg = str(e)

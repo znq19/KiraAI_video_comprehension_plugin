@@ -60,7 +60,7 @@ async def t_hook_nonblocking():
     inst.send_dedup_window_sec = 20
     calls = []
 
-    async def slow_send(_ev, bvid, quality="", sid="", adapter_name=""):
+    async def slow_send(_ev, bvid, quality="", sid="", adapter_name="", info=None):
         calls.append(bvid)
         await asyncio.sleep(3)
         return "✅ 已发送：T\nBV: BV1xx411c7mD | ⏱ 1:00 | 质量: medium\n📁 本地路径: /tmp/v.mp4"
@@ -69,8 +69,12 @@ async def t_hook_nonblocking():
         await asyncio.sleep(5)
         return "BV1xx411c7mD"
 
+    async def fake_info(bvid, *a, **k):
+        return {"title": "T", "duration": 60}
+
     inst._send_video_by_bvid = slow_send
     mod.extract_bvid = slow_extract
+    mod.get_bili_info = fake_info
     ev = make_event(mod, "看看 https://b23.tv/V5Xhy88")
     t0 = time.time()
     await inst._auto_send_hook(ev)
@@ -91,13 +95,14 @@ async def t_hook_nonblocking():
     check("B4 未污染其他消息", "系统提示" not in req.user_prompt[0].content)
     check("B5 文案为「已由插件自动下载并发送」", "已由插件自动下载并发送" in req.user_prompt[1].content
           and "正在" not in req.user_prompt[1].content)
-    check("B6 记录保留待落定（consumed）", (inst._auto_sent.get("qq:gm:g1") or {}).get("consumed") is True)
+    check("B6 注入即消费（不依赖下一轮）", "qq:gm:g1" not in inst._auto_sent)
 
     for t in list(inst._background_tasks):
         if not t.done():
             await t
-    rec = inst._auto_sent.get("qq:gm:g1") or {}
-    check("B7 发送完成 → state=sent", rec.get("state") == "sent", str(rec))
+    _recs = inst._recent_auto.get("qq:gm:g1") or {}
+    _hit = _recs.get("BV1XX411C7MD") or ()
+    check("B7 发送完成 → 窗口状态=sent", len(_hit) >= 3 and _hit[2] == "sent", str(_recs))
     # 成功后再来一轮：静默收尾，不重复标注
     req2 = make_req(mod, "新消息")
     new_msg = types.SimpleNamespace(chain=[sys.modules["core.chat.message_elements"].Text("新消息")])
@@ -147,8 +152,12 @@ async def t_card_message():
     async def fake_extract(url, *a, **k):
         return "BV1xx411c7mD"
 
+    async def fake_info(bvid, *a, **k):
+        return {"title": "T", "duration": 60}
+
     inst._send_video_by_bvid = fake_send
     mod.extract_bvid = fake_extract
+    mod.get_bili_info = fake_info
     await inst._auto_send_hook(ev)
     ok = "qq:gm:g1" in inst._auto_sent
     # 当轮就注入（与真实时序一致：debounce 1.5s 时下载还没完）
@@ -178,6 +187,10 @@ async def t_fail_and_fallback():
     async def fail_send(*a, **k):
         return "⚠️ 下载失败：网络错误"
 
+    async def fake_info(bvid, *a, **k):
+        return {"title": "T", "duration": 60}
+
+    mod.get_bili_info = fake_info
     inst._send_video_by_bvid = fail_send
     eval_ = make_event(mod, "https://b23.tv/V5Xhy88")
     await inst._auto_send_hook(eval_)
@@ -185,19 +198,25 @@ async def t_fail_and_fallback():
     msg = types.SimpleNamespace(chain=[sys.modules["core.chat.message_elements"].Text("看看 https://b23.tv/V5Xhy88")])
     await inst._inject_auto_sent_note(make_batch(mod, [msg]), req)
     check("F1 pending 先标注", "系统提示" in req.user_prompt[0].content)
+    check("F2 注入即消费（不依赖下一轮）", "qq:gm:g1" not in inst._auto_sent)
     for t in list(inst._background_tasks):
         if not t.done():
             await t
-    check("F2 失败 → state=failed", (inst._auto_sent.get("qq:gm:g1") or {}).get("state") == "failed")
     check("D5 失败放行重试", inst._recent_auto_hit("qq:gm:g1", "", "https://b23.tv/V5Xhy88") is None)
-    req2 = make_req(mod, "新消息")
-    new_msg = types.SimpleNamespace(chain=[sys.modules["core.chat.message_elements"].Text("新消息")])
-    await inst._inject_auto_sent_note(make_batch(mod, [new_msg]), req2)
-    tail = [p for p in req2.user_prompt if p.name == "video_auto_sent"]
-    check("F3 失败补一句尾部提示", bool(tail) and "自动发送失败" in tail[0].content, str(tail))
-    check("F4 尾部提示 persist=False", bool(tail) and tail[0].persist is False)
 
-    # 兜底：原始消息不在 batch
+    # 若发送在「首次注入之前」就失败：首次注入直接写失败原因（同轮，不靠下一轮）
+    inst._auto_sent["qq:gm:g1"] = {
+        "rid": "r", "state": "failed", "bvid": "BV1xx411c7mD", "title": "",
+        "file_path": "", "match_keys": ["BV1xx411c7mD", "V5Xhy88"],
+        "message_id": "m1", "text_key": "看看 https://b23.tv/V5Xhy88",
+        "reason": "网络错误", "ts": time.time(),
+    }
+    req2 = make_req(mod, "看看 https://b23.tv/V5Xhy88")
+    await inst._inject_auto_sent_note(make_batch(mod, [msg]), req2)
+    check("F3 失败在首轮就能说明", "自动发送失败" in req2.user_prompt[0].content,
+          req2.user_prompt[0].content)
+
+    # 原始消息不在 batch：什么都不加（绝不能把状态塞进无关的后续对话）
     inst._auto_sent["qq:gm:g1"] = {
         "rid": "r", "state": "sent", "bvid": "BV1xx411c7mD", "title": "T",
         "file_path": "/tmp/v.mp4", "match_keys": ["BV1xx411c7mD"], "message_id": "zzz",
@@ -206,9 +225,51 @@ async def t_fail_and_fallback():
     req3 = make_req(mod, "另一个人说话")
     other = types.SimpleNamespace(chain=[sys.modules["core.chat.message_elements"].Text("另一个人说话")])
     await inst._inject_auto_sent_note(make_batch(mod, [other]), req3)
-    tail3 = [p for p in req3.user_prompt if p.name == "video_auto_sent"]
-    check("C1 原消息不在 batch → 尾部提示", bool(tail3) and "已由插件自动下载并发送" in tail3[0].content)
-    check("C2 尾部提示不写历史", bool(tail3) and tail3[0].persist is False)
+    check("C1 原消息不在 batch → 不追加任何提示",
+          not any(getattr(p, "name", "") == "video_auto_sent" for p in req3.user_prompt))
+    check("C2 记录已丢弃", "qq:gm:g1" not in inst._auto_sent)
+    sc.shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def t_title_prefetch():
+    """后台预取 get_bili_info → 1.5s 的标注尽量带《标题》。"""
+    tmp = tempfile.mkdtemp(prefix="vc_note_")
+    inst, mod = sc.build_plugin(tmp)
+    inst.auto_send_link = True
+    inst.bili_enabled = True
+    inst.auto_send_allowed_sid = []
+    inst.auto_send_dry_run = False
+    inst.dl_timeout = 5
+
+    async def fake_info(bvid, *a, **k):
+        return {"title": "预取标题", "duration": 60}
+
+    async def fake_extract(url, *a, **k):
+        return "BV1xx411c7mD"
+
+    async def slow_send(*a, **k):
+        await asyncio.sleep(0.3)
+        return "✅ 已发送：预取标题\nBV: BV1xx411c7mD | ⏱ 1:00 | 质量: low\n📁 本地路径: /tmp/v.mp4"
+
+    mod.get_bili_info = fake_info
+    mod.extract_bvid = fake_extract
+    inst._send_video_by_bvid = slow_send
+    ev = make_event(mod, "https://b23.tv/V5Xhy88")
+    await inst._auto_send_hook(ev)
+    for _ in range(20):
+        if (inst._auto_sent.get("qq:gm:g1") or {}).get("title"):
+            break
+        await asyncio.sleep(0.02)
+    rec = inst._auto_sent.get("qq:gm:g1") or {}
+    check("L1 后台预取到标题", rec.get("title") == "预取标题", str(rec.get("title")))
+    msg = types.SimpleNamespace(chain=[sys.modules["core.chat.message_elements"].Text("https://b23.tv/V5Xhy88")])
+    req = make_req(mod, "https://b23.tv/V5Xhy88")
+    await inst._inject_auto_sent_note(make_batch(mod, [msg]), req)
+    check("L2 当轮标注带《标题》", "《预取标题》" in req.user_prompt[0].content,
+          req.user_prompt[0].content)
+    for t in list(inst._background_tasks):
+        if not t.done():
+            await t
     sc.shutil.rmtree(tmp, ignore_errors=True)
 
 
@@ -216,6 +277,7 @@ async def main():
     await t_hook_nonblocking()
     await t_card_message()
     await t_fail_and_fallback()
+    await t_title_prefetch()
     print("\n" + "=" * 60)
     print(f"通过 {len(PASS)} / 失败 {len(FAIL)}")
     if FAIL:
