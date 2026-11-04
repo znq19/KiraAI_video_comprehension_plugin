@@ -34,6 +34,11 @@ async def main():
         "analysis_budget_sec": 200, "notice_coalesce_sec": 0.1,
         "max_parallel_per_chat": 3,
     })
+    # 测试不打网络：B站信息查询直接失败（插件会回落到默认标题/时长）
+    async def _offline_bili_info(*a, **k):
+        raise RuntimeError("offline (e2e)")
+    main_mod.get_bili_info = _offline_bili_info
+
     notices = []
     inst.ctx.publish_notice = lambda sid, chain, is_mentioned=True: sc._fake_notice(notices, sid, chain)
     # 让插件有「模型组」，否则 _vision 会返回「未配置模型」

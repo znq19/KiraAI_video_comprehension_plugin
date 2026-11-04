@@ -13,7 +13,7 @@ KiraAI 视频理解插件：自动检测 QQ 视频消息，压缩 + 三级抽帧
 7. **多模型路由** — 4 组独立配置（`frames` 与 `native` **严格隔离**，frames 组绝不会有 video_url），按优先级 + 时长自动选择；`native`（传视频）或 `frames`（传拼图）。**可以按名字指定**：「用 Agnes 抽帧分析」→ bot 传 `model="Agnes"` 即可
 8. **会话管理** — 首轮分析 + 后续追问（`session_id`），新视频自动切换会话；**模型粘性**（追问默认沿用首次分析用的模型组）
 9. **时间段分析** — bot 可指定只看第 N~M 秒，支持一次多段（最多 5 段、每段 ≤300 秒）
-10. **B 站能力** — 链接自动下载发送（0 token）、搜索、AI 总结优先、按质量下载、html5 直链直传
+10. **B 站能力** — 链接自动下载发送（0 token）、搜索、AI 总结优先、按质量下载、html5 直链直传；**发送视频对 QQ / QQ 官方 / Telegram / Discord / 微信 / WebChat 等所有声明支持 `video` 的适配器开放**（B 站动态这类纯文本适配器会明确提示不支持）
 
 ## 自定义请求头 / 请求体（每组模型独立）
 
@@ -457,7 +457,12 @@ analyze_video(session_id="abc123", segments=[[10,30],[100,130]])   # 一次多�
 ### B 站配置
 - `bili_cookie`：**AI 总结必需**（B 站接口要求登录，无 cookie 返回 `-101 账号未登录`）；下载高清/大会员视频也需要
 - `bili_use_ai_summary`：优先用 B 站官方 AI 总结（免费、不消耗模型 token），失败自动降级视觉分析
-- `auto_send_link`：检测到消息里的 B 站链接自动下载发送（0 token）
+- `auto_send_link`：检测到消息里的 B 站链接自动下载发送（0 token）。发送后会在**那条链接消息**的 LLM 上下文末尾追加
+  `[系统提示：该B站视频（BV…）已由插件自动下载并发送]`（不需要模型再判断要不要发）
+- `send_dedup_enabled`：**默认关闭**。开启后自动发送进行中会拦 `send_video`，成功后 `send_dedup_window_sec`（默认 20 秒）内拦同一个 BV；关闭时完全交给模型按上下文自行判断
+- `send_dedup_window_sec`：防重发窗口秒数，默认 20（仅上面开启时生效）
+- **平台支持**：`send_video` / 自动发送对 **QQ、QQ 官方、Telegram、Discord、微信、WebChat** 等所有声明支持 `video` 的适配器开放（非 QQ 平台走框架通用发送链，由适配器自己上传）；B 站动态等纯文本适配器会明确提示「当前平台不支持发送视频」，不会发出占位文本
+- **QQ 官方机器人**：自动发送/`send_video` 均可用。装了 `qqbot-fullmsg-bridge` 时走桥接（视频 `file_type=2`）；没装则插件自己按官方 OpenAPI 直传。官方视频软上限 30MB，超了会先压 720p，仍超则明确拒绝
 
 ### 抽帧参数
 - `target_frames`：总目标帧数（默认 40）
@@ -568,6 +573,16 @@ python3 tests/audit_media_v1180.py  # 30 项：真实 ffmpeg、进程 kill、回
 
 <details>
 <summary><b>📜 更新日志</b>（点击展开，共 20+ 个版本）</summary>
+
+- **1.18.1** — **修复「B站链接自动发送后，那条链接的消息没有被标注」+ 去掉 hook 联网阻塞 + QQ 官方机器人发视频**
+  - **根因（时序）**：`_auto_sent` 记录原先要等**下载+发送成功后才写**，而 LLM 请求最早在 debounce（默认 1.5 秒）后就发生，B 站下载通常十几秒 → **当轮永远赶不上**；后续轮次的 batch 里又没有那条链接消息 → 标注永远不生效（表现为「好像没了/偶发才生效」）。
+  - **修法（确定性、零等待）**：检测到链接时**立即**写入 `state=pending` 的记录，当轮就把它追加到**原始链接消息**上，文案为「`[系统提示：该B站视频（BV…）已由插件自动下载并发送]`」；发送完成后把状态推进到 `sent`（下一轮静默收尾，不重复刷），失败则在下一轮用 `persist=False` 的尾部提示补一句失败原因。原始消息不在本轮批次时同样退化为尾部提示。
+  - **不再阻塞消息管线**：`b23.tv` 短链解析从 `im_message` hook 挪到后台任务（此前 B 站不可达最坏会让整条消息线等 2×下载超时）；`raw_message` 兜底扫描只在消息含非 Text 元素（卡片/小程序）时才做，纯文字消息不再每条白跑 `json.dumps`。
+  - **防重发窗口（`send_dedup_enabled`，默认关闭）**：默认完全交给模型按上下文判断；开启后，自动发送进行中会拦 `send_video`，成功后 `send_dedup_window_sec`（默认 **20 秒**）内拦同一个 BV，失败放行重试。
+  - **QQ 官方机器人**：`_is_qq` 放行 `QQ Official`；发视频时若检测到 `qqbot-fullmsg-bridge` 已挂载（`_upload_file` 带 `_kira_bridge_ftype` 且 `_send_message` 已包装），走框架通用发送链（Video 换壳 + `file_type=2`）；否则插件自己按官方 OpenAPI 直传（`POST /v2/(groups|users)/…/files` + `msg_type=7`）。官方 30MB 软上限：超了先压 720p，仍超则明确拒绝，不会静默发成文件卡片。`_detect` 里的 `get_msg` 兜底改为仅 OneBot（`_is_onebot`）。
+  - **缓存安全**：标注只追加到当前 user 消息尾部（或尾部 `persist=False` Prompt），system prompt 与历史前缀逐字节不变；`assemble_prompt` 前后系统提示哈希一致（已用 KiraAI 3.1.2 真框架验证）。
+  - **跨平台通用化**：`send_video` / 自动发送不再写死 QQ —— 只要适配器声明支持 `video`（Telegram/Discord/微信/WebChat…）就走框架通用发送链；B 站动态等不支持的直接明确提示，不会发占位文本。
+  - 新增 `tests/audit_auto_sent_note.py`（24 项：时序、状态机、卡片消息、兜底、防重发开关与窗口）、`tests/audit_official_send.py`（25 项：官方直传/桥接、2.x/3.x 结构、`file_type=2`、`msg_id/msg_seq`、30MB 与回复次数边界）与 `tests/audit_platforms.py`（14 项：跨平台能力判断与通用发送）。
 
 - **1.18.0** — **全链路可靠性、缓存治理与真异步强化（配置结构不变，可直接升级）**
   - **磁盘与临时产物**：修复正常分析后 `vcf_*` 帧目录残留；`.asr_*` 中间 WAV 在成功/失败/取消后清理；`.transcripts/*.json` 按单文件纳入 TTL/容量/条数治理；活动任务与 `.ffmpeg` 明确保护。B 站仍只按条数清理，不新增容量限制。

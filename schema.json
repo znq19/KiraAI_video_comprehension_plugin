@@ -526,6 +526,20 @@
         "default": false,
         "hint": "排查用：开启后自动钩子只会检测并打印日志（[VCDIAG]），不会真的去下载/发送视频。用于定位问题出在检测阶段还是发送阶段。排查完请关掉"
       },
+      "send_dedup_enabled": {
+        "type": "switch",
+        "name": "防重发窗口（默认关）",
+        "default": false,
+        "hint": "默认关闭。开启后：自动发送进行中会拦下 send_video；发送成功后 N 秒内同一个 BV 也会被拦下。关闭时完全交给模型按上下文自行判断（推荐保持关闭，避免限制 bot 自由）"
+      },
+      "send_dedup_window_sec": {
+        "type": "integer",
+        "name": "防重发时长(秒)",
+        "default": 20,
+        "hint": "仅在开启「防重发窗口」时生效。默认 20 秒，建议不要设太长",
+        "minimum": 5,
+        "maximum": 600
+      },
       "napcat_stream_upload": {
         "type": "switch",
         "name": "大文件分块上传(仅 NapCat 扩展)",
