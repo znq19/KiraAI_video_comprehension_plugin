@@ -193,7 +193,7 @@ def static_checks():
           re.search(r"expired\|expires\|expire\|expire_at\|ts", main_src) is not None
           and "无法判断剩余时间" in main_src)
     check("N3 自动发送占位",
-          'pend.get("source") == "auto_send"' in main_code)
+          'pend.get("rid") == rid' in main_code)
     check("N5 work 目录带随机后缀", "uuid.uuid4().hex[:6]" in main_code)
     check("并发：B站同名文件下载串行化（防同视频并发写同一文件）",
           'async with self._session_lock(f"bili:{bvid}")' in main_code)
@@ -294,6 +294,12 @@ def build_plugin(tmpdir, cfg=None):
     chat.message_elements.Text = _Text
     chat.message_elements.Image = type("Image", (), {"__init__": lambda self, *a, **k: None})
 
+    class _Video:
+        def __init__(self, file="", name=None, size=None, mime=None):
+            self.file, self.name = file, name
+
+    chat.message_elements.Video = _Video
+
     provider = types.ModuleType("core.provider")
     provider.LLMRequest = type("LLMRequest", (), {})
 
@@ -344,7 +350,7 @@ def build_plugin(tmpdir, cfg=None):
     # ⚠️ 必须与 VideoComprehensionPlugin.__init__ 的字段保持同步
     #    （清理防御性 getattr 后，少一个字段就会 AttributeError）
     for attr, val in [("_pending", {}), ("_sessions", {}), ("_sid_sessions", {}),
-                      ("_locks", {}), ("_cleanup", None), ("_auto_sent", {}),
+                      ("_locks", {}), ("_cleanup", None), ("_auto_sent", {}), ("_recent_auto", {}),
                       ("_ffmpeg_ok", False), ("_ffmpeg_task", None),
                       ("_stream_unsupported", False),
                       ("_upload_cache", {}), ("_cached_videos", {}),

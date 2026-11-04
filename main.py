@@ -2,7 +2,7 @@
 Video Comprehension 插件 — QQ/B站视频理解
 
 功能：
-  - send_video 工具：下载B站视频+压缩+发送到QQ
+  - send_video 工具：下载B站视频+压缩+发送到当前聊天平台（QQ/官方/Telegram/Discord/微信/WebChat…）
   - search_bili_video 工具：搜索B站视频
   - analyze_video 工具（默认关）：视频内容分析
   - 自动链接检测钩子（默认关）
@@ -33,7 +33,7 @@ if _PLUGIN_DIR not in sys.path:
 from core.plugin import BasePlugin, logger, on, Priority, register
 from core.chat.message_utils import KiraMessageEvent, KiraMessageBatchEvent
 from core.chat import MessageChain
-from core.chat.message_elements import Text
+from core.chat.message_elements import Text, Video
 from core.provider import LLMRequest
 from core.prompt_manager import Prompt
 from core.utils.path_utils import get_data_path
@@ -49,6 +49,9 @@ from llm_proxy import (ModelProfile, select_model, build_meta, analyze_frames,
                        analyze_native, NATIVE_MAX_MB, _as_dict)
 from bili_dl import (search_bili, get_bili_info, get_ai_summary, download_bili_video,
                      extract_bvid, get_bilibili_subtitle, get_bili_direct_url)
+
+# B站「锦上添花」查询（标题 / 时长提示）的超时：慢网下不能拖住整个分析流程
+BILI_INFO_QUICK_TIMEOUT = 8.0
 
 BILI_RE = re.compile(r"(BV[0-9A-Za-z]{10}|b23\.tv/[^\s]+|bilibili\.com/(?:video/|BV))", re.I)
 
@@ -252,7 +255,8 @@ class VideoComprehensionPlugin(BasePlugin):
         self._sid_sessions: dict[str, list[str]] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._cleanup: Optional[asyncio.Task] = None
-        self._auto_sent: dict[str, dict] = {}  # sid → {bvid, title, file_path, text}
+        self._auto_sent: dict[str, dict] = {}  # sid → {rid,state,bvid,title,file_path,match_keys,message_id,ts}
+        self._recent_auto: dict[str, dict] = {}  # sid → {BV号: (发送时间, 标题)}，防重发窗口
         self._ffmpeg_ok = False
         self._ffmpeg_task: Optional[asyncio.Task] = None
         self._stream_unsupported = False
@@ -337,6 +341,14 @@ class VideoComprehensionPlugin(BasePlugin):
         self.auto_send_link = bs.get("auto_send_link", False)
         # 诊断用：只检测不发送（用于定位"收到链接就崩"是检测阶段还是发送阶段）
         self.auto_send_dry_run = bool(bs.get("auto_send_dry_run", False))
+        # 防重发窗口：默认关闭（交给模型按上下文自行判断）；开启后 pending 期间
+        # 拦 send_video，成功后 window 秒内拦同一个 BV。
+        self.send_dedup_enabled = bool(bs.get("send_dedup_enabled", False))
+        try:
+            self.send_dedup_window_sec = int(bs.get("send_dedup_window_sec", 20))
+        except (TypeError, ValueError):
+            self.send_dedup_window_sec = 20
+        self.send_dedup_window_sec = max(5, min(600, self.send_dedup_window_sec))
         # NapCat 的 upload_file_stream（第三方扩展 action，分块上传）—— 默认关闭。
         # 官方 NapCat 没有它，同类软件（AstrBot 等）也不用它；直接用本地路径发送
         # 对 NapCat / SnowLuma 都够用。开启后才尝试分块上传（失败仍会自动降级）。
@@ -732,6 +744,7 @@ class VideoComprehensionPlugin(BasePlugin):
         self._video_failures.clear()
         self._video_failure_times.clear()
         self._auto_sent.clear()
+        self._recent_auto.clear()
         self._upload_cache.clear()
         self._locks.clear()
         self._task_seq.clear()
@@ -892,6 +905,12 @@ class VideoComprehensionPlugin(BasePlugin):
                 for sid, sent in list(self._auto_sent.items()):
                     if now - float(sent.get("ts") or 0) > 300:
                         self._auto_sent.pop(sid, None)
+                for sid, recs in list(self._recent_auto.items()):
+                    kept = {bv: v for bv, v in recs.items() if now - float(v[0]) < 600}
+                    if kept:
+                        self._recent_auto[sid] = kept
+                    else:
+                        self._recent_auto.pop(sid, None)
                 for sid, pending in list(self._pending.items()):
                     if now - float(pending.get("ts") or 0) > 600:
                         self._pending.pop(sid, None)
@@ -975,9 +994,64 @@ class VideoComprehensionPlugin(BasePlugin):
             pass
         return ""
 
+    def _recent_auto_hit(self, sid: str, cand_bvid: str = "", target: str = ""):
+        """查「刚刚自动发送过 / 正在自动发送」的同一视频。
+
+        返回 (时间戳, 标题, 状态) 或 None。
+        - 默认关闭（send_dedup_enabled=False）→ 直接返回 None，完全不干预模型
+        - pending：正在后台下载发送，拦（否则会发第二遍）
+        - sent：开启时在 send_dedup_window_sec（默认 20s）内拦
+        - failed：不拦，允许重试
+        """
+        if not self.send_dedup_enabled:
+            return None
+        window = float(self.send_dedup_window_sec or 20)
+        now = time.time()
+        recs = self._recent_auto.get(sid) or {}
+        cand = str(cand_bvid or "").strip().upper()
+
+        def _alive(v) -> bool:
+            ts, _title, state = v
+            age = now - float(ts)
+            return (state == "pending" and age < 300) or (state == "sent" and age < window)
+
+        if cand and cand in recs and _alive(recs[cand]):
+            return recs[cand]
+        if target:
+            up = str(target).upper()
+            for k, v in recs.items():
+                if k and k in up and _alive(v):
+                    return v
+        return None
+
+    def _mark_recent_failed(self, sid: str, bvid: str, rec: dict | None):
+        """发送失败 → 放开防重发窗口，允许模型/用户重试。"""
+        now = time.time()
+        recs = self._recent_auto.get(sid) or {}
+        for _k in [bvid] + list((rec or {}).get("match_keys") or []):
+            _ku = str(_k).upper()
+            if _ku and not _ku.startswith("HTTP") and _ku in recs:
+                recs[_ku] = (now, "", "failed")
+
+    #: QQ 系平台：OneBot（"QQ"）与官方机器人（"QQ Official"）
+    _QQ_PLATFORMS = ("qq", "qq official")
+
     def _is_qq(self, event) -> bool:
-        """判断是否 QQ 平台（platform 来自适配器 manifest.name，内置为 "QQ"，大小写不敏感）"""
+        """是否 QQ 系平台（OneBot 或官方机器人）。"""
+        return str(getattr(event.adapter, "platform", "") or "").strip().lower() in self._QQ_PLATFORMS
+
+    def _is_onebot(self, event) -> bool:
+        """是否 OneBot 系（只有它才有 send_action / get_msg 这类原始 action）。"""
         return str(getattr(event.adapter, "platform", "") or "").strip().lower() == "qq"
+
+    @staticmethod
+    def _event_can_video(event) -> bool:
+        """当前适配器是否声明支持发送 video 元素（Telegram/Discord/微信/WebChat 都支持）。"""
+        try:
+            els = getattr(event, "supported_elements", None) or []
+            return "video" in {str(e).strip().lower() for e in els}
+        except Exception:
+            return False
 
     def _ok(self, event) -> bool:
         if not self.allowed_adapters: return True
@@ -1539,7 +1613,8 @@ class VideoComprehensionPlugin(BasePlugin):
         if not self.bili_enabled: return
         if self.auto_send_allowed_sid and event.session.sid not in self.auto_send_allowed_sid:
             return
-        if not self._is_qq(event):
+        # QQ 走专用发送路径；其它平台只要适配器声明支持 video 就同样开放
+        if not self._is_qq(event) and not self._event_can_video(event):
             return
         # 防御：bot 自己发的消息（有些实现会上报）绝不能触发自动发送，
         # 否则就会"自己刚发完又一个视频，钩子检测到链接再发一遍" → 重复刷屏
@@ -1571,42 +1646,48 @@ class VideoComprehensionPlugin(BasePlugin):
                       text, re.I)
         if m:
             bvid = m.group(1)
+            if bvid[:2].lower() == "bv":      # 链接里的 bv 前缀可能小写
+                bvid = "BV" + bvid[2:]
 
         # b23 短链（也必须是带协议的完整短链）
+        # ⚠️ 这里**绝不能 await 联网解析**：本 hook 在 ReceiveStage 里被顺序 await，
+        #    一联网整条消息管线（含其他插件的 im_message / 默认聊天缓冲）都会被卡住，
+        #    B站不可达时最坏要等 2×dl_timeout。短链 id 本身就能当上下文匹配键，
+        #    BV 号交给后台任务解析（见 _auto_send_do）。
+        short_url = ""
         if not bvid:
             m2 = re.search(r'https?://b23\.tv/([0-9A-Za-z]+)', text)
             if m2:
-                try:
-                    bvid = await extract_bvid(m2.group(0), self.dl_timeout)
-                except Exception:
-                    logger.info("[VC] b23 短链解析失败: %s", m2.group(1))
-                if not bvid:
-                    logger.info("[VC] b23 短链未解析出 BV 号，跳过自动发送: %s", m2.group(0))
+                short_url = m2.group(0)
 
         # 兜底：如果链文本里没有，再从 raw_message 里找一次（有些适配器
-        # 把卡片原文放在别处）
-        if not bvid:
+        # 把卡片原文放在别处）。
+        # ⚠️ 只在「链里有非 Text 元素（卡片/小程序等）」时才扫：
+        #    否则每条纯文字消息都要白做一次 json.dumps（群里 99% 是纯文字）。
+        if not bvid and not short_url:
             try:
                 import json as _json
-                raw = getattr(event, "raw_message", None)
-                if raw is None and hasattr(event, "message"):
-                    raw = getattr(event.message, "raw_message", None)
-                if raw is None and hasattr(event, "message") and hasattr(event.message, "source_message"):
-                    raw = getattr(event.message, "source_message", None)
-                if isinstance(raw, dict):
-                    raw = _json.dumps(raw, ensure_ascii=False)
-                if isinstance(raw, str) and raw:
-                    m3 = re.search(r'https?://b23\.tv/([0-9A-Za-z]+)', raw)
-                    if m3:
-                        bvid = await extract_bvid(m3.group(0), self.dl_timeout)
-                    if not bvid:
-                        m4 = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})', raw, re.I)
-                        if m4:
-                            bvid = m4.group(1)
+                chain_items = list(getattr(event.message, "chain", None) or [])
+                if any(not isinstance(ele, Text) for ele in chain_items):
+                    raw = getattr(event, "raw_message", None)
+                    if raw is None and hasattr(event, "message"):
+                        raw = getattr(event.message, "raw_message", None)
+                    if raw is None and hasattr(event, "message") and hasattr(event.message, "source_message"):
+                        raw = getattr(event.message, "source_message", None)
+                    if isinstance(raw, dict):
+                        raw = _json.dumps(raw, ensure_ascii=False)
+                    if isinstance(raw, str) and raw:
+                        m3 = re.search(r'https?://b23\.tv/([0-9A-Za-z]+)', raw)
+                        if m3:
+                            short_url = m3.group(0)
+                        else:
+                            m4 = re.search(r'https?://(?:www\.|m\.)?bilibili\.com/video/(BV[0-9A-Za-z]{10})', raw, re.I)
+                            if m4:
+                                bvid = m4.group(1)
             except Exception:
                 pass
 
-        if not bvid:
+        if not bvid and not short_url:
             # 没有明确的B站链接是**常态**（群里绝大多数消息都没链接），静默跳过。
             # 注意：这里千万不要打日志 —— 每条消息都会走到这，会疯狂刷屏，
             # 而且"没触发"不代表检测有问题。真正需要关注的是「看到链接但解析失败」
@@ -1615,63 +1696,142 @@ class VideoComprehensionPlugin(BasePlugin):
         # 记录"用来在上下文里定位这条消息"的匹配键。
         # ⚠️ 不能只用 bvid：消息里写的可能是 b23 短链（V5Xhy88 这种），
         #    或藏在 QQ 小程序卡片的 qqdocurl 里，用 BV 号是匹配不上的。
-        match_keys = [bvid]
+        match_keys = []
+        if bvid:
+            match_keys.append(bvid)
         m2 = re.search(r'b23\.tv/([0-9A-Za-z]+)', text)
         if m2:
             match_keys.append(m2.group(1))
+        if short_url:
+            match_keys.append(short_url)
+        match_keys = list(dict.fromkeys(match_keys))
         mid = self._msg_id(event)
-        logger.info("[VCDIAG] 3/6 检测到B站视频 bvid=%s keys=%s", bvid, match_keys)
-        logger.info("[VC] auto_send 检测到B站视频: %s（匹配键=%s）", bvid, match_keys)
+        logger.info("[VCDIAG] 3/6 检测到B站视频 bvid=%s keys=%s", bvid or "(短链待解析)", match_keys)
+        logger.info("[VC] auto_send 检测到B站视频: %s（匹配键=%s）", bvid or short_url, match_keys)
         if self.auto_send_dry_run:
             logger.info("[VCDIAG] dry_run=开 → 只检测不发送，到此为止")
             return
         # N4：后台发送（最长 180 秒）期间，用户若刚好 @bot 问这个视频，
         #     _pending 里没有条目 → bot 会答「当前无视频」。这里**先占位**，
         #     发送完成（成功走 _auto_sent 标注、失败则清掉）再交接。
+        #
+        # ⚠️ 标注记录必须在这里（发送之前）就写好：
+        #    LLM 请求最早在 debounce(1.5s) 后就会发生，而下载通常要十几秒。
+        #    如果等到发送成功才写 _auto_sent，这一轮永远赶不上（旧版就是这样），
+        #    后续轮次的 batch 里又没有这条链接消息 → 标注永远不生效。
+        #    现在先记 state="pending"，本轮一定能把「已被插件接管」写进上下文。
+        rid = uuid.uuid4().hex
+        self._auto_sent[sid] = {
+            "rid": rid,
+            "state": "pending",
+            "bvid": bvid,
+            "title": "",
+            "file_path": "",
+            "match_keys": match_keys,
+            "message_id": mid,
+            "ts": time.time(),
+        }
         if sid not in self._pending:
-            self._pending[sid] = {"url": f"https://www.bilibili.com/video/{bvid}",
+            self._pending[sid] = {"url": f"https://www.bilibili.com/video/{bvid}" if bvid else short_url,
                                   "source": "auto_send", "ts": time.time(),
-                                  "bvid": bvid}
-        self._spawn(self._auto_send_do(bvid, event.adapter.name, sid,
-                                       match_keys=match_keys, message_id=mid),
+                                  "bvid": bvid, "rid": rid}
+        # 防重发窗口从「检测到」就开始：下载期间模型若调 send_video 会被拦下。
+        _now = time.time()
+        _recs = self._recent_auto.setdefault(sid, {})
+        if bvid:
+            _recs[bvid.upper()] = (_now, "", "pending")
+        for _k in match_keys:
+            _ku = str(_k).upper()
+            if _ku and not _ku.startswith("HTTP") and not _ku.startswith("BV"):
+                _recs[_ku] = (_now, "", "pending")
+        self._spawn(self._auto_send_do(rid, bvid, short_url,
+                                       adapter_name=event.adapter.name, sid=sid,
+                                       match_keys=match_keys),
                     name="vc_auto_send")
         logger.info("[VCDIAG] 4/6 后台任务已创建（hook 返回，不再占用消息处理）")
 
-    async def _auto_send_do(self, bvid: str, adapter_name: str, sid: str,
-                            match_keys: list | None = None, message_id: str = ""):
-        """异步后台发送，成功后记录 auto_sent 用于 LLM 上下文标注"""
+    async def _auto_send_do(self, rid: str, bvid: str, short_url: str = "",
+                            adapter_name: str = "", sid: str = "",
+                            match_keys: list | None = None):
+        """后台发送：先解析短链再发送，全程不阻塞消息管线。
+
+        标注记录已在 _auto_send_hook 里以 state="pending" 写好（保证当轮 LLM
+        一定能看到），这里只负责把状态推进到 sent / failed，并记录防重发窗口。
+        """
+        def _rec() -> dict:
+            r = self._auto_sent.get(sid) or {}
+            return r if r.get("rid") == rid else {}
+
         try:
+            if not bvid and short_url:
+                try:
+                    bvid = await extract_bvid(short_url, self.dl_timeout)
+                except Exception as e:
+                    logger.info("[VC] b23 短链解析失败: %s (%s)", short_url, e)
+            if not bvid:
+                logger.warning("[VC] auto_send 未解析出 BV 号: %s", short_url or match_keys)
+                rec = _rec()
+                if rec:
+                    rec.update(state="failed", reason="短链解析失败", ts=time.time())
+                self._mark_recent_failed(sid, bvid, rec)
+                # 检测时先占的 _pending 必须撤掉，否则 bot 会以为有视频可分析
+                pend = self._pending.get(sid) or {}
+                if pend.get("rid") == rid:
+                    self._pending.pop(sid, None)
+                return
+            # BV 号解析出来之后补进匹配键，并把 _pending 的占位补全
+            rec = _rec()
+            if rec:
+                rec["bvid"] = bvid
+                keys = list(rec.get("match_keys") or [])
+                if bvid not in keys:
+                    keys.append(bvid)
+                rec["match_keys"] = keys
+            pend = self._pending.get(sid) or {}
+            if pend.get("rid") == rid:
+                pend["bvid"] = bvid
+                pend["url"] = f"https://www.bilibili.com/video/{bvid}"
             logger.info("[VCDIAG] 5/6 后台任务开始 bvid=%s sid=%s", bvid, sid)
             reply = await self._send_video_by_bvid(None, bvid, sid=sid, adapter_name=adapter_name)
             logger.info("[VCDIAG] 6/6 发送函数返回: %s", str(reply)[:80])
+            rec = _rec()
             if reply and reply.startswith("✅"):
-                # 成功 → 记录 auto_sent，不 discard，消息继续自然流转
+                # 成功 → 记录 sent 状态（不 discard，消息继续自然流转）
                 title = bvid
                 for line in reply.split("\n"):
                     if "已发送：" in line:
                         title = line.split("已发送：")[-1].strip()
-                self._auto_sent[sid] = {
-                    "bvid": bvid,
-                    "title": title,
-                    "file_path": reply.split("本地路径:")[-1].strip() if "本地路径:" in reply else "",
-                    # 用于在 LLM 上下文里定位原始消息（短链/卡片消息不能靠 bvid 匹配）
-                    "match_keys": list(match_keys or [bvid]),
-                    "message_id": str(message_id or ""),
-                    "ts": time.time(),
-                }
+                if rec:
+                    rec.update(state="sent", bvid=bvid, title=title,
+                               file_path=reply.split("本地路径:")[-1].strip() if "本地路径:" in reply else "",
+                               ts=time.time())
+                # 防重发窗口：LLM 若无视上下文标注又调 send_video，直接拦下
+                _now = time.time()
+                _recs = self._recent_auto.setdefault(sid, {})
+                for _k in [bvid] + list((rec or {}).get("match_keys") or []):
+                    _ku = str(_k).upper()
+                    if _ku and not _ku.startswith("HTTP"):
+                        _recs[_ku] = (_now, title, "sent")
             elif reply:
                 # 失败 → **只记日志，不发到会话里**（自动钩子是后台行为，
                 # 报错刷屏会打扰群聊；要看就去 cmd / 日志里看）
                 logger.warning("[VC] auto_send 未成功: %s", reply)
+                if rec:
+                    rec.update(state="failed", reason=str(reply)[:120], ts=time.time())
+                self._mark_recent_failed(sid, bvid, rec)
                 # N4：占位的 _pending 要撤掉，避免 bot 以为有视频可分析
                 pend = self._pending.get(sid) or {}
-                if pend.get("source") == "auto_send" and pend.get("bvid") == bvid:
+                if pend.get("rid") == rid:
                     self._pending.pop(sid, None)
         except Exception as e:
             # 同上：异常也只落日志，不往会话里发消息
             logger.warning("[VC] auto_send 异常: %s", e)
+            rec = _rec()
+            if rec:
+                rec.update(state="failed", reason=str(e)[:120], ts=time.time())
+            self._mark_recent_failed(sid, bvid, rec)
             pend = self._pending.get(sid) or {}
-            if pend.get("source") == "auto_send" and pend.get("bvid") == bvid:
+            if pend.get("rid") == rid:
                 self._pending.pop(sid, None)
 
     # ── 批次阶段缓存（避免群里与 bot 无关的视频也被下载+转写） ──
@@ -1711,6 +1871,23 @@ class VideoComprehensionPlugin(BasePlugin):
 
     # ── 已直发的 LLM 上下文标注（对齐音频条 inject_auto_sent_note） ──
 
+    @staticmethod
+    def _auto_sent_note(sent: dict) -> str:
+        """生成标注文案。
+
+        用户要求：文案只陈述事实「已由插件自动下载并发送」，不要「正在/请勿重复」
+        这类指令 —— 现代模型的判断力足够，多余的祈使句反而限制它。
+        失败时单独说明原因，便于模型决定要不要补发。
+        """
+        bvid = str(sent.get("bvid") or "")
+        title = str(sent.get("title") or "")
+        label = f"《{title}》" if title else ""
+        bv = f"（{bvid}）" if bvid else ""
+        if (sent.get("state") or "") == "failed":
+            return (f"\n[系统提示：该B站视频{label}{bv}自动发送失败"
+                    f"（{sent.get('reason') or '未知原因'}）]")
+        return f"\n[系统提示：该B站视频{label}{bv}已由插件自动下载并发送]"
+
     @on.llm_request(priority=Priority.LOW)
     async def _inject_auto_sent_note(self, event: KiraMessageBatchEvent, req: LLMRequest, *_):
         if not self.enabled: return
@@ -1723,14 +1900,24 @@ class VideoComprehensionPlugin(BasePlugin):
         if time.time() - float(sent.get("ts") or 0) > 300:
             self._auto_sent.pop(sid, None)
             return
-        note = (
-            f"\n[系统提示：该B站视频（《{sent['title']}》"
-            f"BV:{sent['bvid']}）已自动发送压缩版视频（{sent.get('file_path','')}）]"
-        )
-        bvid = sent["bvid"]
+        if sent.get("consumed"):
+            # 上一轮已经写过「正在发送」；这里只在最终失败时补一句，
+            # 成功则静默收尾（不重复刷标注，也不多花 token）。
+            if sent.get("state") == "failed":
+                note = self._auto_sent_note(sent)
+                if note and not any(getattr(p, "name", "") == "video_auto_sent"
+                                    for p in req.user_prompt):
+                    req.user_prompt.append(Prompt(note.strip(), name="video_auto_sent",
+                                                  source="system", persist=False))
+            self._auto_sent.pop(sid, None)
+            return
+        note = self._auto_sent_note(sent)
+        if not note:
+            return
+        bvid = str(sent.get("bvid") or "")
         # 匹配键：bvid + b23 短链 id（消息里写的可能是短链或藏在卡片里）
         keys = [k for k in (sent.get("match_keys") or []) if k]
-        if bvid not in keys:
+        if bvid and bvid not in keys:
             keys.append(bvid)
         want_mid = str(sent.get("message_id") or "")
         # 按顺序遍历 messages ↔ user_prompt，定位原始消息追加 note
@@ -1753,10 +1940,26 @@ class VideoComprehensionPlugin(BasePlugin):
                 msg_text = _collect_chain_text(getattr(msg, "chain", None))
                 hit = any(k in msg_text for k in keys)
             if hit:
-                p.content += note
-                self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉
-                logger.info("[VC] 已在上下文里标注「已自动发送」: %s", bvid)
-                break
+                p.content = (p.content or "") + note
+                if sent.get("state") == "pending":
+                    sent["consumed"] = True      # 先留着，失败时下一轮还能补一句
+                else:
+                    self._auto_sent.pop(sid, None)   # 标注成功 → 消费掉
+                logger.info("[VC] 已在上下文里标注「已由插件自动下载并发送」: %s",
+                            bvid or (keys[0] if keys else "?"))
+                return
+
+        # 原始消息已经不在本轮 batch 里（例如上一条被丢弃后才有的请求）：
+        # 退化成尾部的临时提示。persist=False → 不进历史、不动 system 前缀。
+        if not any(getattr(p, "name", "") == "video_auto_sent" for p in req.user_prompt):
+            req.user_prompt.append(Prompt(note.strip(), name="video_auto_sent",
+                                          source="system", persist=False))
+            logger.info("[VC] 原始链接消息不在本轮批次，改用尾部临时标注: %s",
+                        bvid or (keys[0] if keys else "?"))
+        if sent.get("state") == "pending":
+            sent["consumed"] = True
+        else:
+            self._auto_sent.pop(sid, None)
 
     # ── 改写消息里的视频占位（让 bot 拿到可用的路径，而不是"没缓存"） ──
 
@@ -2333,7 +2536,7 @@ class VideoComprehensionPlugin(BasePlugin):
         #    只在「确实有视频迹象」时才调，避免每条纯文字消息都白跑一次 API
         reply_ids = self._reply_message_ids(chain_top)
         # 主动调 get_msg 是 OneBot 的能力，其他平台只靠消息链/raw_message
-        if not url and self._is_qq(event) and (saw_video_ele or has_video_seg or reply_ids):
+        if not url and self._is_onebot(event) and (saw_video_ele or has_video_seg or reply_ids):
             try:
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
                 cl = ad.get_client()
@@ -2436,7 +2639,7 @@ class VideoComprehensionPlugin(BasePlugin):
 
     @register.tool(
         name="send_video",
-        description="下载B站视频并发送到QQ（可压缩），也支持本地视频路径发送。用户要求下载/发B站视频时调用。传关键词返回候选列表。",
+        description="下载B站视频并发送到当前聊天平台（可压缩），也支持本地视频路径发送。用户要求下载/发B站视频时调用。传关键词返回候选列表。",
         params={
             "type": "object",
             "properties": {
@@ -2448,8 +2651,31 @@ class VideoComprehensionPlugin(BasePlugin):
         },
     )
     async def _tool_send_video(self, event, target: str = "", bvid: str = "", local_path: str = "", quality: str = "") -> str:
-        if not self._is_qq(event): return "当前不是QQ"
+        if not self._is_qq(event) and not self._event_can_video(event):
+            # 事件没带 supported_elements 的适配器：再按能力元数据确认一次
+            try:
+                _ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
+                _can = bool(_ad) and await self._adapter_supports_video(_ad)
+            except Exception:
+                _can = False
+            if not _can:
+                return "当前平台不支持发送视频"
         sid = self._sid(event)
+        # 防重发：同一个 BV 刚被自动发送过（窗口 180s），不再下载/发送第二遍。
+        # 上下文标注可能因为时序/模型忽略而失效，这里是最后一道硬保险。
+        if not local_path:
+            _cand = str(bvid or "").strip()
+            if not _cand and target:
+                _m = re.search(r'(BV[0-9A-Za-z]{10})', target)
+                if _m:
+                    _cand = _m.group(1)
+            _hit = self._recent_auto_hit(sid, _cand, target)
+            if _hit:
+                _age = int(time.time() - float(_hit[0]))
+                if _hit[2] == "pending":
+                    return f"⏳ 该视频正在自动下载发送中（{_age} 秒前开始），请勿重复发送。"
+                return (f"✅ 该视频刚刚已自动发送过（《{_hit[1]}》，"
+                        f"{_age} 秒前），无需重发。")
         if local_path:
             # 本地文件（绝对路径直用，相对路径基于 get_data_path() 解析）
             lp = local_path.strip()
@@ -2479,6 +2705,11 @@ class VideoComprehensionPlugin(BasePlugin):
                 out_path = lp
             try:
                 ad = self.ctx.adapter_mgr.get_adapter(event.adapter.name)
+                platform = str(getattr(getattr(ad, "info", None), "platform", "") or "").strip().lower()
+                if platform == "qq official":
+                    return await self._send_video_official(ad, sid, out_path, "", Path(lp).name, 0, q)
+                if platform != "qq":
+                    return await self._send_generic_video(ad, sid, out_path, "", Path(lp).name, 0, q)
                 cl = ad.get_client()
                 # 同 _send_video_by_bvid：框架默认 10 秒超时对"发视频"远远不够
                 _send_to = 180
@@ -2517,7 +2748,11 @@ class VideoComprehensionPlugin(BasePlugin):
         return "\n".join(lines)
 
     async def _send_video_by_bvid(self, event, bvid: str, quality: str = "", sid: str = "", adapter_name: str = "") -> str:
-        """发送B站视频到QQ（内置 NapCat 分块上传防断连）
+        """发送B站视频到当前会话。
+
+        - QQ（OneBot）：内置 NapCat 分块上传防断连；
+        - QQ 官方：桥接优先，缺失则官方 OpenAPI 直传；
+        - 其它平台：走框架通用发送链（Video 元素），由适配器自己上传。
         event 可为 None（auto_send 钩子 discard 后用 adapter_name 参数代替）
         """
         # BV 号规范化：bot 传进来的值可能带空格/换行，或整个链接。
@@ -2580,6 +2815,14 @@ class VideoComprehensionPlugin(BasePlugin):
         if not ad_name: return "⚠️ 无法获取 adapter"
         try:
             ad = self.ctx.adapter_mgr.get_adapter(ad_name)
+            platform = str(getattr(getattr(ad, "info", None), "platform", "") or "").strip().lower()
+            # QQ 官方机器人：send_action 那套 OneBot 原始接口不存在，走专用路径
+            if platform == "qq official":
+                return await self._send_video_official(ad, send_sid, out_path, bvid, title, d, q)
+            # 非 QQ 平台（Telegram / Discord / 微信 / WebChat…）：走框架通用发送链，
+            # 只要适配器声明支持 video，就由它自己上传，不依赖任何 QQ 原始接口
+            if platform != "qq":
+                return await self._send_generic_video(ad, send_sid, out_path, bvid, title, d, q)
             cl = ad.get_client()
             is_group = "gm:" in send_sid
             target_id = int(send_sid.split(":")[-1])
@@ -2654,11 +2897,194 @@ class VideoComprehensionPlugin(BasePlugin):
                         f"   原始错误: {msg}")
             return f"⚠️ 发送失败：{msg}"
         return f"✅ 已发送：{title}\nBV: {bvid} | ⏱ {d//60}:{d%60:02d} | 质量: {q}\n📁 本地路径: {out_path}"
+
+    # ────────────── QQ 官方机器人发送路径 ──────────────
+
+    @staticmethod
+    def _official_ready_for_video(ad) -> bool:
+        """qqbot-fullmsg-bridge 是否已把「Video→File + file_type=2」装到该适配器。
+
+        桥接会在能力对象上挂 `_upload_file`（带 `_kira_bridge_ftype` 标记）并
+        包装 `_send_message`（负责把 Video 换壳成 File）。两者都在才走框架通用
+        发送链，否则走插件自己的直传 —— 避免核心把 Video 渲染成
+        `[Unsupported message element]` 发出去。
+        """
+        try:
+            from core.adapter.capabilities import IMCapability
+            cap = ad.get_capability(IMCapability)
+        except Exception:
+            # 2.x 没有 capabilities 模块：能力方法直接挂在适配器上
+            cap = getattr(ad, "im", None) or ad
+        if cap is None:
+            return False
+        return (bool(getattr(getattr(cap, "_upload_file", None), "_kira_bridge_ftype", False))
+                and "_send_message" in getattr(cap, "__dict__", {}))
+
+    @staticmethod
+    async def _adapter_supports_video(ad) -> bool:
+        """适配器是否声明支持发送 video 元素。
+
+        3.x 走能力元数据（`get_message_metadata().supported_elements`）；
+        2.x 没有该接口，回落到 `message_types`。
+        """
+        try:
+            from core.adapter.capabilities import IMCapability
+            cap = ad.get_capability(IMCapability)
+        except Exception:
+            # 2.x 没有 capabilities 模块：能力方法直接挂在适配器 / .im 上
+            cap = getattr(ad, "im", None) or ad
+        try:
+            meta = await cap.get_message_metadata()
+            els = getattr(meta, "supported_elements", None) or []
+            return "video" in {str(e).strip().lower() for e in els}
+        except Exception:
+            pass
+        try:
+            els = getattr(ad, "message_types", None) or []
+            return "video" in {str(e).strip().lower() for e in els}
+        except Exception:
+            return False
+
+    async def _send_generic_video(self, ad, sid: str, out_path: str, bvid: str,
+                                  title: str, duration: int, quality: str) -> str:
+        """非 QQ 平台：走框架通用发送链（Video 元素），由适配器自己上传。
+
+        Telegram / Discord / 微信 / WebChat 等适配器都已支持 Video 元素；
+        不支持的直接明确报错，绝不把 `[Unsupported message element]` 当视频发出去。
+        """
+        if not await self._adapter_supports_video(ad):
+            return "⚠️ 当前平台不支持发送视频"
+        try:
+            name = f"{bvid or Path(out_path).stem}.mp4"
+            res = await self.ctx.send_message_chain(sid, MessageChain([Video(out_path, name=name)]))
+            if res is not None and getattr(res, "ok", True):
+                return self._sent_ok_text(title, bvid, duration, quality, out_path)
+            return f"⚠️ 发送失败：{getattr(res, 'err', '') or '未知错误'}"
+        except Exception as e:
+            return f"⚠️ 发送失败：{e}"
+
+    @staticmethod
+    def _sent_ok_text(title: str, bvid: str, duration: int, quality: str, out_path: str) -> str:
+        name = title or Path(out_path).name
+        if bvid:
+            return (f"✅ 已发送：{name}\nBV: {bvid} | ⏱ {duration//60}:{duration%60:02d} | "
+                    f"质量: {quality}\n📁 本地路径: {out_path}")
+        return f"✅ 已发送本地视频：{name}"
+
+    async def _send_video_official(self, ad, sid: str, out_path: str, bvid: str,
+                                   title: str, duration: int, quality: str) -> str:
+        """QQ 官方机器人发视频（file_type=2，原生可播放）。
+
+        两条路：
+          ① 装了 qqbot-fullmsg-bridge 且已挂到该适配器 → 走框架通用发送链，
+             由桥接把 Video 换壳成 File 并修正 file_type=2（含引用/主动兜底）；
+          ② 否则插件自己按官方 OpenAPI 直传（同样 file_type=2），不依赖桥接。
+        官方软上限 30MB：超了先压 720p，仍超就明确拒绝（不会静默发成文件卡片）。
+        """
+        limit = 30 * 1024 * 1024
+        try:
+            size = os.path.getsize(out_path)
+        except OSError:
+            size = 0
+        if size > limit:
+            try:
+                dst = self._compression_cache_path(
+                    self.bili_cache_dir, f"official_{bvid or 'local'}", out_path, 720, 30)
+                out_path = await self._compress_cached(out_path, dst, max_width=720, crf=30)
+                size = os.path.getsize(out_path)
+            except Exception as e:
+                logger.warning("[VC] 官方视频压到 30MB 以内失败: %s", e)
+        if size > limit:
+            return (f"⚠️ 视频 {size / 1048576:.1f}MB 超过 QQ 官方 30MB 限制，未发送；"
+                    f"可把「B站压缩质量」调成 low 后重试")
+
+        if self._official_ready_for_video(ad):
+            try:
+                res = await self.ctx.send_message_chain(
+                    sid, MessageChain([Video(out_path, name=f"{bvid or 'video'}.mp4")]))
+                if res is not None and getattr(res, "ok", False):
+                    return self._sent_ok_text(title, bvid, duration, quality, out_path)
+                logger.warning("[VC] 官方发送（桥接）未成功: %s",
+                               getattr(res, "err", "") if res is not None else "no result")
+            except Exception as e:
+                logger.warning("[VC] 官方发送（桥接）异常: %s", e)
+        return await self._official_upload_and_send(ad, sid, out_path, bvid, title, duration, quality)
+
+    async def _official_upload_and_send(self, ad, sid: str, out_path: str, bvid: str,
+                                        title: str, duration: int, quality: str) -> str:
+        """不依赖桥接的官方直传：POST /v2/(groups|users)/…/files (file_type=2) → msg_type=7。"""
+        client = ad.get_client() if hasattr(ad, "get_client") else None
+        if client is None:
+            return "⚠️ QQ 官方机器人未连接"
+        try:
+            from botpy.http import Route
+        except Exception:
+            return "⚠️ 缺少 qq-botpy，无法上传视频"
+
+        parts = sid.split(":", 2)
+        is_group = len(parts) >= 2 and parts[1] == "gm"
+        target = parts[-1]
+        try:
+            raw = await asyncio.to_thread(Path(out_path).read_bytes)
+            b64 = (await asyncio.to_thread(base64.b64encode, raw)).decode("ascii")
+        except Exception as e:
+            return f"⚠️ 读取视频失败：{e}"
+        payload = {"file_type": 2, "file_data": b64, "srv_send_msg": False,
+                   "file_name": f"{bvid or 'video'}.mp4"}
+        if is_group:
+            payload["group_openid"] = target
+            route = Route("POST", "/v2/groups/{group_openid}/files", group_openid=target)
+        else:
+            payload["openid"] = target
+            route = Route("POST", "/v2/users/{openid}/files", openid=target)
+        try:
+            resp = await client.api._http.request(route, json=payload)
+        except Exception as e:
+            return f"⚠️ 官方媒体上传失败：{e}"
+        file_info = resp.get("file_info") if isinstance(resp, dict) else getattr(resp, "file_info", None)
+        if not file_info:
+            return "⚠️ 官方媒体上传未返回 file_info"
+
+        # 被动回复：msg_id 必须是收到的那条消息，msg_seq 同一 msg_id 最多 5 次
+        try:
+            from core.adapter.capabilities import IMCapability
+            cap = ad.get_capability(IMCapability)
+        except Exception:
+            # 2.x：`_group_reply_ids` 直接挂在适配器实例上
+            cap = getattr(ad, "im", None) or ad
+        reply_id, seq = "", 1
+        try:
+            ids = cap._group_reply_ids if is_group else cap._direct_reply_ids
+            reply_id = str(ids.get(target) or "")
+            if reply_id:
+                key = (is_group, target, reply_id)
+                seq = int(cap._reply_msg_seqs.get(key, 0)) + 1
+                if seq > 5:
+                    return "⚠️ 该消息的被动回复次数已用完（5 次），让用户再发一条消息后重试"
+        except Exception:
+            pass
+        kwargs = {"group_openid": target} if is_group else {"openid": target}
+        kwargs.update({"msg_type": 7, "media": {"file_info": file_info}})
+        if reply_id:
+            kwargs["msg_id"] = reply_id
+            kwargs["msg_seq"] = seq
+        try:
+            send = client.api.post_group_message if is_group else client.api.post_c2c_message
+            await send(**kwargs)
+        except Exception as e:
+            return f"⚠️ 官方视频发送失败：{e}"
+        if reply_id:
+            try:
+                cap._reply_msg_seqs[(is_group, target, reply_id)] = seq
+            except Exception:
+                pass
+        return self._sent_ok_text(title, bvid, duration, quality, out_path)
+
     # ────────────── 工具3：analyze_video（分析开关控制） ──────────────
 
     @register.tool(
         name="analyze_video",
-        description=("分析视频内容。支持QQ视频/B站视频/本地路径。首次返回session_id，追问传回。"
+        description=("分析视频内容。支持聊天平台视频/B站视频/本地路径。首次返回session_id，追问传回。"
                      "只看某一段时间就传 start_sec/end_sec（数字秒）；一次看多段传 segments=[[起,止],...]（最多5段、每段≤300秒）。"
                      "时间段分析会复用已下载的视频，不会重新下载。"
                      "【重要】首次分析是**后台进行**的：本工具会立刻返回一句「已开始分析」，"
@@ -2993,9 +3419,11 @@ class VideoComprehensionPlugin(BasePlugin):
             except Exception as e:
                 logger.info("[VC] B站AI降级: %s", e)
         elif source_type == "bilibili":
-            # 即使不走 AI 总结，也先把真实标题拿到，通告里更好读
+            # 即使不走 AI 总结，也先把真实标题拿到，通告里更好读。
+            # ⚠️ 限时 8 秒：这只是锦上添花，B站接口慢时不能拖住整个分析流程
             try:
-                info = await get_bili_info(bvid, self.bili_cookie)
+                info = await get_bili_info(bvid, self.bili_cookie,
+                                           timeout=BILI_INFO_QUICK_TIMEOUT)
                 if info.get("title"):
                     task.title = str(info["title"])
             except Exception:
@@ -3195,7 +3623,8 @@ class VideoComprehensionPlugin(BasePlugin):
             duration_hint = sum(e - s for s, e in segments)
         elif stype == "bilibili" and bvid:
             try:
-                _info = await get_bili_info(bvid, self.bili_cookie)
+                _info = await get_bili_info(bvid, self.bili_cookie,
+                                            timeout=BILI_INFO_QUICK_TIMEOUT)
                 duration_hint = float(_info.get("duration") or 0) or self.max_duration
             except Exception:
                 pass
